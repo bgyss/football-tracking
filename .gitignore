@@ -1,0 +1,8 @@
+.venv/
+.uv-cache/
+artifacts/
+data/*.mp4
+*.egg-info/
+*.pyc
+__pycache__/
+.pytest_cache/

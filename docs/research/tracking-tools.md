@@ -1,0 +1,59 @@
+# Tracking tools and evidence
+
+Researched 2026-09-09. Recommendation: use local RF-DETR Small/Medium detection, Roboflow's maintained `trackers.BoTSORTTracker` for short-term tracks, and `supervision` for detections, video utilities and overlays. Keep team classification and persistent player identity in explicit layers above the tracker. Evaluate ByteTrack as the inexpensive baseline and reserve mask-assisted tracking for failures demonstrated on the sample. These are design recommendations; no model inference, latency measurement or tracking accuracy evaluation was performed for this research note.
+
+## Verified integrations
+
+| Component | Verified capability | Consequence for this project |
+| --- | --- | --- |
+| RF-DETR | Local Python `RFDETRSmall` / `RFDETRMedium` models; `predict()` returns `supervision.Detections`; NumPy input uses RGB. | Convert OpenCV BGR frames before prediction. Start with person detection only as a smoke test; football-specific weights need validation. |
+| Roboflow `trackers` | Detector-independent `update(detections, frame=None, timestamp=None)` API; BoT-SORT includes camera-motion compensation and two-stage association. | Pass the BGR frame for CMC and source timestamps when sampling frames. Use a new tracker for each shot. |
+| `supervision` | Shared detections, annotation and video helpers; its embedded ByteTrack is deprecated. | Use `trackers.ByteTrackTracker.update()` for new work, not legacy `sv.ByteTrack.update_with_detections()`. |
+| Original BoT-SORT | Motion, camera compensation and optional FastReID appearance association. | Valuable algorithm reference, but its documented Python 3.7 / Torch 1.11 / CUDA 11.3 environment is a less suitable starting point for this Mac than the modern Roboflow adapter. |
+| Roboflow `sports` | Reusable team classifier, ball helpers and view transformation examples. Team classifier uses SigLIP embeddings, UMAP and two-cluster KMeans. | Reuse the approach, inspect individual components, and fit football-specific team examples. Team clustering does not identify individual teammates. |
+
+Sources: [RF-DETR 1.10.1 prediction source](https://github.com/roboflow/rf-detr/blob/1.10.1/src/rfdetr/detr.py), [BoT-SORT adapter source](https://github.com/roboflow/trackers/blob/c25b23472acc71bea37d2e5849199e06a225e9c0/src/trackers/core/botsort/tracker.py), [supervision ByteTrack deprecation](https://github.com/roboflow/supervision/blob/6337efe58e924fa5a40090501b41c6cdab4365f8/src/supervision/tracker/byte_tracker/core.py), [original BoT-SORT README](https://github.com/NirAharon/BoT-SORT/blob/251985436d6712aaf682aaaf5f71edb4987224bd/README.md), [sports team classifier](https://github.com/roboflow/sports/blob/42c80c06b6b65a7f89455b89fe31cdf4c38ba227/sports/common/team.py).
+
+Roboflow's `trackers` implementation deliberately omits appearance/ReID branches offered by the original papers. A track ID is therefore a short-term association result, not a jersey number or a persistent roster identity. `lost_track_buffer=30` means one second: it is specified in frames at 30 FPS and scaled by the configured frame rate. BoT-SORT's first association uses detection-confidence-weighted IoU, so its threshold is not interchangeable with a plain IoU threshold. The adapter has a fixed 0.1 floor for low-confidence association; filtering detector output at 0.5 before tracking would discard much of the recovery evidence. [Trackers algorithm scope](https://github.com/roboflow/trackers/blob/c25b23472acc71bea37d2e5849199e06a225e9c0/README.md), [BoT-SORT parameters and RGB/BGR example](https://trackers.roboflow.com/latest/trackers/botsort/).
+
+Version snapshot from GitHub releases: [RF-DETR 1.10.1](https://github.com/roboflow/rf-detr/releases/tag/1.10.1), [supervision 0.30.2](https://github.com/roboflow/supervision/releases/tag/0.30.2), [trackers 2.6.0](https://github.com/roboflow/trackers/releases/tag/2.6.0). RF-DETR and supervision default branches already identify themselves as development versions. Treat these release versions as an integration starting point; installation compatibility and model execution remain untested here.
+
+## Football resources and dataset fit
+
+Roboflow published an American-football tutorial using RF-DETR Small with ByteTrack and the model identifier `nfl-detection-1500-jdrgz/4`. It reports detector mAP@50 of 74.8%, precision 90.8%, and recall 71.5%. Those are the tutorial author's detector results, not measured identity stability or evidence on the Lions–Rams sample. The post does not establish cross-angle ReID. Treat the model identifier as a discovery lead until its exact workspace, classes, checkpoint access and training-data provenance are confirmed. [American-football tutorial](https://blog.roboflow.com/american-football-player-tracker/).
+
+Do not confuse soccer with American football. Roboflow's `sports` README explicitly categorizes `football-players-detection-3zvbc`, `football-ball-detection-rejhg` and `football-field-detection-f07vi` as **soccer** datasets. Its soccer field geometry cannot be reused as NFL field geometry. The adjacent basketball jersey OCR dataset can inform an OCR workflow but does not prove recognition on helmeted football players. [Roboflow sports dataset list](https://github.com/roboflow/sports/blob/42c80c06b6b65a7f89455b89fe31cdf4c38ba227/README.md).
+
+A useful American-football research reference is AFMOT/MOTAF (MMSports 2025), with wide and tight handheld views, 11,411 annotated frames, 188,711 boxes and 505 tracks. The paper reports BoT-SORT HOTA rising from 29.6 to 45.7 after detector and ReID adaptation. Its ablation attributes most of the improvement to detector fine-tuning; ReID-only adaptation adds just 0.3 HOTA. This supports prioritizing football detection quality before a larger identity model, but does not establish NFL All-22 performance. [AFMOT paper](https://arxiv.org/html/2511.09455v1).
+
+AFMOT is a restricted research lead, not the default training source: its access text requires noncommercial academic research and prohibits redistribution; its card also prohibits identifying individuals. The metadata says CC BY-NC 4.0 while the body says CC BY-NC-SA 4.0. Resolve this discrepancy with the publisher before any use; no access request or download was made. [Dataset card and access conditions](https://huggingface.co/datasets/rinost081/AFMOT).
+
+For the project dataset, annotate representative football frames and contiguous identity sequences, especially line-of-scrimmage contact, crossings and the second camera angle. Split by play/game and keep both views of a play in the same partition. Random frame splits would overstate generalization because neighboring frames and replay views share the same events. This is a proposed evaluation design, not a claim about any external dataset's current splits.
+
+## Modern alternatives
+
+| Option | Why evaluate it | What prevents promoting it now |
+| --- | --- | --- |
+| ByteTrack | Small CPU association overhead and simple baseline; same Roboflow API. | Motion association lacks BoT-SORT's CMC. Need identical cached detections to make a fair comparison. |
+| C-BIoU / OC-SORT | Buffered geometric matching or observation-centric recovery can help nonlinear sports motion. | Their relative performance on this football clip is unknown; avoid choosing from unrelated benchmark rankings. |
+| McByte | Combines BoT-SORT-style association with propagated masks for ambiguous matches. | Mask management is **off by default**. Full mode requires separate SAM and Cutie installations/weights. A bare `McByteTracker()` run does not test the advertised mask-assisted method. |
+| SAM 3.1 | Text/exemplar prompted detection, segmentation and video tracking; useful as an annotation assistant or difficult-occlusion experiment. | Needs separate model/terms/runtime assessment and football-specific validation. Masks do not themselves establish roster identity or replay alignment. |
+| Football-trained appearance embeddings | Could add visual evidence when geometry and jersey readings are ambiguous. | Same-team uniforms reduce discriminative cues; learn and evaluate on football tracklets, with uncertainty and abstention. |
+
+Roboflow reports McByte SportsMOT HOTA 76.5 versus its BoT-SORT baseline 73.8 with mask assistance enabled. These numbers were reported by McByte's author using the documented benchmark setup; SoccerNet results use oracle boxes, while other benchmark datasets use YOLOX detections. They are not comparable to RF-DETR on the provided video. [McByte implementation and prerequisites](https://github.com/roboflow/trackers/blob/c25b23472acc71bea37d2e5849199e06a225e9c0/docs/trackers/mcbyte.md), [benchmark methodology](https://github.com/roboflow/trackers/blob/c25b23472acc71bea37d2e5849199e06a225e9c0/README.md).
+
+Meta's March 2026 SAM 3.1 update reports multiplexing up to 16 objects per forward pass and 32 FPS on an H100 in its described workload. Neither the hardware nor the object count matches an M1 Max tracking 22 players plus officials. Treat this as a vendor throughput claim, not a local performance estimate. [Meta SAM 3.1 announcement](https://ai.meta.com/blog/segment-anything-model-3/).
+
+## Licenses and deployment scope
+
+- RF-DETR's open-source package and Apache-designated weights use Apache 2.0. Detection XL/2XL and the Plus extension use PML 1.0; do not generalize the smaller models' license to every variant. [RF-DETR component licensing](https://github.com/roboflow/rf-detr/blob/75c25038dc408627fc2acf0c5711b93ee235dc1c/README.md#license).
+- Roboflow `trackers` uses [Apache 2.0](https://github.com/roboflow/trackers/blob/c25b23472acc71bea37d2e5849199e06a225e9c0/LICENSE); `supervision` uses [MIT](https://github.com/roboflow/supervision/blob/6337efe58e924fa5a40090501b41c6cdab4365f8/LICENSE.md); `sports` uses [MIT](https://github.com/roboflow/sports/blob/42c80c06b6b65a7f89455b89fe31cdf4c38ba227/LICENSE); original BoT-SORT uses [MIT](https://github.com/NirAharon/BoT-SORT/blob/251985436d6712aaf682aaaf5f71edb4987224bd/LICENSE).
+- Dataset permissions, model checkpoint terms and optional dependencies need their own provenance records. A repository license does not establish permission to redistribute an unrelated broadcast clip or dataset.
+
+## Design implications for stable identities
+
+Use immutable `(shot_id, tracklet_id)` keys and a separately versioned `player_id` mapping. Combine team evidence, high-quality jersey observations across several frames, within-shot geometry and manual corrections; add a vision-language model only for selected ambiguous crop sequences. Do not let a single model guess silently rewrite a trajectory. Persist confidence and evidence references for every identity merge.
+
+Reset the geometric tracker at the sideline/endzone edit. Linking those shots requires an explicit same-play time alignment and identity matching step: a replay restarts the event timeline even though its video timestamps increase. A field homography is shot-specific and camera-motion-dependent; image trails alone are not distances or speeds in yards. Keep missing and occluded positions distinct from observations.
+
+The first meaningful comparison is RF-DETR + ByteTrack versus the same detections + BoT-SORT, scored on annotated football intervals with IDF1, HOTA, ID switches, fragmentation and visible-player recall. Then evaluate the team/identity layer and cross-view reconciliation separately. Cost and latency must be measured on the configured hardware and actual request policy; the quoted basketball cost and latency are not an estimate for this system.
