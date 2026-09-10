@@ -8,6 +8,8 @@ The first version prioritizes **stable anonymous player IDs, teams, and trajecto
 - [Evaluation plan](docs/evaluation-plan.md): measurable acceptance criteria and fair comparisons.
 - [Tool research](docs/research/tracking-tools.md): primary sources, current APIs, alternatives, and licenses.
 - [Sample footage assessment](docs/evidence/footage-assessment.md): verified metadata and inspected frames.
+- [Accuracy, calibration, and replay guide](docs/accuracy-calibration-replay.md): how to move from the baseline to football accuracy, yard-space calibration, and cross-view identity.
+- [Local annotation and data generation](docs/annotation-and-data-generation.md): CVAT/SAM2/FiftyOne workflow for reviewing initial tracks and fine-tuning RF-DETR without hosted Roboflow services.
 
 Status: **implemented and locally benchmarked**. The supplied [sample video](data/all-22-lions-rams-sample.mp4) is 23.76 seconds and contains a sideline view followed by an apparent end-zone replay. The implementation includes local model inference and proxy benchmarks; no GPT-6 Astra request or footage upload was performed.
 
