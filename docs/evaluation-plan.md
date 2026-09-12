@@ -1,6 +1,6 @@
 # Tracking evaluation plan
 
-These are proposed engineering acceptance targets, not achieved results. The supplied clip has been inspected but no model has been run. Evaluate the first version on stable player IDs, teams, and trajectories.
+These are proposed engineering acceptance targets, not achieved results. The README records a local generic-checkpoint RF-DETR/BoT-SORT integration run; it does not establish ground-truth tracking accuracy. Evaluate the first version on stable player IDs, teams, and trajectories.
 
 ## Ground truth and split policy
 
@@ -23,6 +23,8 @@ Scores on this single play are development evidence. A release evaluation needs 
 | Same resolver + selective Astra | Does semantic assistance improve identity quality at acceptable cost? |
 
 Cache RF-DETR output so tracker differences are not confounded by detector settings. Separately test detector resolution, tiling, and model size only if recall is inadequate. Compare on equal reference coverage, and disclose processing modes that use future frames. An optional SAM or sports-embedding experiment must beat the simpler path on these same measurements before adoption.
+
+For the proposed mask-assisted tracker experiment, follow the [McByte evaluation plan](mcbyte-evaluation-plan.md) and its [integration goal prompt](goals/mcbyte-integration.md). It adds a controlled real-cache comparison and explicit quality gates while retaining these reference and split rules.
 
 ## Proposed gates
 
