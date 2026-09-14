@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, Sequence
 
 import numpy as np
@@ -270,3 +271,136 @@ class RoboflowTracker:
     @property
     def active_track_count(self) -> int:
         return len(self._active_ids)
+
+
+class McByteTracker:
+    """Lazy McByte adapter with an explicit RGB and mask-assets boundary.
+
+    McByte's mask manager is temporal, so callers must provide every decoded
+    source frame (including frames with no detections) and call ``reset`` at a
+    shot boundary.  Weight acquisition is deliberately outside this class.
+    """
+
+    def __init__(
+        self,
+        fps: float,
+        device: str,
+        enable_masks: bool,
+        sam_checkpoint: str | Path | None = None,
+        cutie_checkpoint: str | Path | None = None,
+        backend: Any | None = None,
+        shot_id: str = "shot-0",
+    ) -> None:
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        if device not in {"cpu", "cuda", "mps"}:
+            raise ValueError("McByte device must be one of: cpu, cuda, mps")
+        self.fps = float(fps)
+        self.device = device
+        self.enable_masks = bool(enable_masks)
+        self.sam_checkpoint = Path(sam_checkpoint) if sam_checkpoint is not None else None
+        self.cutie_checkpoint = Path(cutie_checkpoint) if cutie_checkpoint is not None else None
+        self._shot_id = str(shot_id)
+        self._external_backend = backend is not None
+        self._fallback_reason: str | None = None
+        if self.enable_masks and not self._external_backend:
+            self._validate_mask_device()
+            missing = [str(path) for path in (self.sam_checkpoint, self.cutie_checkpoint) if path is None or not path.is_file()]
+            if missing:
+                raise FileNotFoundError("McByte mask-enabled mode requires existing --mcbyte-sam-checkpoint and --mcbyte-cutie-checkpoint files")
+        self.backend = backend if backend is not None else self._load_backend()
+
+    def _validate_mask_device(self) -> None:
+        """Reject a requested accelerator before backend construction can fetch assets."""
+
+        try:
+            import torch  # type: ignore[import-not-found]
+        except ImportError as error:
+            raise RuntimeError("McByte mask-enabled mode requires torch from the mcbyte optional dependencies") from error
+        if self.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("McByte requested device 'cuda' is unavailable")
+        if self.device == "mps":
+            backend = getattr(torch, "backends", None)
+            mps = getattr(backend, "mps", None)
+            if mps is None or not mps.is_available():
+                raise RuntimeError("McByte requested device 'mps' is unavailable")
+
+    def _load_backend(self) -> Any:
+        try:
+            import trackers  # type: ignore[import-not-found]
+        except ImportError as error:
+            raise RuntimeError("McByte requires the optional dependencies; install with --extra mcbyte") from error
+        if not hasattr(trackers, "McByteTracker") or not hasattr(trackers, "McByteMaskConfig"):
+            raise RuntimeError("installed trackers package does not export McByteTracker/McByteMaskConfig; expected trackers==2.6.0")
+        kwargs: dict[str, Any] = {"frame_rate": self.fps, "enable_mask_manager": self.enable_masks}
+        if self.enable_masks:
+            kwargs["mask_config"] = trackers.McByteMaskConfig(
+                device=self.device,
+                sam_checkpoint_path=str(self.sam_checkpoint),
+                cutie_weights_path=str(self.cutie_checkpoint),
+            )
+        return trackers.McByteTracker(**kwargs)
+
+    def reset(self, shot_id: str | None = None) -> None:
+        if shot_id is not None:
+            self._shot_id = str(shot_id)
+        reset = getattr(self.backend, "reset", None)
+        if not callable(reset):
+            raise RuntimeError("McByte backend does not support reset; cannot safely cross a shot cut")
+        reset()
+        self._fallback_reason = None
+
+    def _masks_active(self) -> bool:
+        if not self.enable_masks:
+            return False
+        manager = getattr(self.backend, "mask_manager", None)
+        if manager is None:
+            return False
+        for name in ("enabled", "is_enabled", "active"):
+            value = getattr(manager, name, None)
+            if isinstance(value, bool):
+                return value
+        return self._fallback_reason is None
+
+    def effective_mode(self) -> dict[str, Any]:
+        return {
+            "kind": "mcbyte",
+            "shot_id": self._shot_id,
+            "device": self.device,
+            "masks_requested": self.enable_masks,
+            "masks_active": self._masks_active(),
+            "fallback_reason": self._fallback_reason,
+            "consecutive_mask_failures": getattr(self.backend, "_consecutive_mask_failures", 0),
+            "sam_checkpoint": str(self.sam_checkpoint) if self.sam_checkpoint else None,
+            "cutie_checkpoint": str(self.cutie_checkpoint) if self.cutie_checkpoint else None,
+        }
+
+    def update(
+        self,
+        detections: Sequence[Detection],
+        frame_bgr: np.ndarray | None,
+        timestamp_s: float,
+        frame_index: int | None = None,
+        pts: int | None = None,
+    ) -> list[TrackObservation]:
+        if frame_bgr is None:
+            raise ValueError("McByte requires every native BGR frame for temporal mask propagation")
+        if timestamp_s < 0:
+            raise ValueError("timestamp_s must be non-negative")
+        resolved_frame = int(round(timestamp_s * self.fps)) if frame_index is None else int(frame_index)
+        resolved_pts = resolved_frame if pts is None else int(pts)
+        # This is the only BGR/RGB conversion on the McByte path.
+        frame_rgb = np.ascontiguousarray(frame_bgr[..., ::-1])
+        backend_input = detections if self._external_backend else _as_detections(detections)
+        try:
+            output = self.backend.update(backend_input, frame=frame_rgb, timestamp=timestamp_s)
+        except RuntimeError as error:
+            if "out of memory" not in str(error).lower():
+                raise
+            self._fallback_reason = f"{type(error).__name__}: {error}"
+            raise RuntimeError("McByte mask processing failed; run is degraded and cannot satisfy the mask-active gate") from error
+        rows = _backend_rows(output)
+        return [
+            TrackObservation(f"{self._shot_id}:t{identifier}", resolved_frame, resolved_pts, box, score)
+            for identifier, box, score in sorted(rows, key=lambda row: row[0])
+        ]
