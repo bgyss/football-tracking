@@ -9,7 +9,7 @@ description = "Offline American football player tracking with RF-DETR and Robofl
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
-  "opencv-python-headless>=4.10",
+  "opencv-python>=4.10",
   "pyarrow>=17",
   "scipy>=1.13",
 ]
@@ -19,6 +19,12 @@ roboflow = [
   "rfdetr==1.10.1",
   "trackers==2.6.0",
   "supervision==0.30.2",
+]
+mcbyte = [
+  "trackers[mask]==2.6.0",
+]
+evaluation = [
+  "trackeval==1.1.0",
 ]
 dev = [
   "pytest>=8.0",

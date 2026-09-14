@@ -21,6 +21,21 @@ def test_parser_exposes_run_and_benchmark_commands() -> None:
     parser = build_parser()
     assert parser.parse_args(["run", "--input", "video.mp4", "--output", "out"]).command == "run"
     assert parser.parse_args(["benchmark", "--input", "video.mp4", "--output", "out"]).command == "benchmark"
+    assert parser.parse_args(["cache", "--input", "video.mp4", "--output", "chunk.jsonl", "--detector-class-mapping", "classes.json"]).command == "cache"
+
+
+def test_parser_exposes_explicit_mcbyte_mask_configuration() -> None:
+    args = build_parser().parse_args([
+        "run", "--input", "video.mp4", "--output", "out", "--tracker", "mcbyte",
+        "--mcbyte-device", "cpu", "--mcbyte-sam-checkpoint", "sam.pth",
+        "--mcbyte-cutie-checkpoint", "cutie.pth", "--mcbyte-masks", "off",
+        "--detector-class-mapping", "classes.json",
+    ])
+
+    assert args.tracker == "mcbyte"
+    assert args.mcbyte_device == "cpu"
+    assert args.mcbyte_masks == "off"
+    assert args.detector_class_mapping.name == "classes.json"
 
 
 def test_benchmark_writes_report_for_synthetic_detector(tmp_path) -> None:
@@ -39,6 +54,29 @@ def test_benchmark_writes_report_for_synthetic_detector(tmp_path) -> None:
 
 def test_run_rejects_missing_input() -> None:
     assert main(["run", "--input", "missing.mp4", "--output", "out", "--detector", "synthetic"]) != 0
+
+
+def test_run_rejects_a_nonpositive_memory_budget(tmp_path) -> None:
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
+
+    assert main(["run", "--input", str(input_path), "--output", str(tmp_path / "out"), "--detector", "synthetic", "--max-memory-mb", "0"]) != 0
+
+
+def test_cache_chunks_merge_into_a_strict_complete_replay_cache(tmp_path) -> None:
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
+    classes = tmp_path / "classes.json"
+    classes.write_text('{"0":"player"}', encoding="utf-8")
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    merged = tmp_path / "merged.jsonl"
+    common = ["--input", str(input_path), "--detector", "synthetic", "--detector-class-mapping", str(classes)]
+
+    assert main(["cache", *common, "--output", str(first), "--start-frame", "0", "--end-frame", "2"]) == 0
+    assert main(["cache", *common, "--output", str(second), "--start-frame", "2", "--end-frame", "4"]) == 0
+    assert main(["merge-cache", *common, "--output", str(merged), "--part", str(first), "--part", str(second)]) == 0
+    assert merged.is_file()
 
 
 def test_run_records_detection_and_tracking_stage_timings(tmp_path) -> None:

@@ -22,6 +22,68 @@ Create the isolated environment and install the local and Roboflow adapters:
 UV_CACHE_DIR=.uv-cache uv sync --extra dev --extra roboflow
 ```
 
+McByte is opt-in and never changes the BoT-SORT default. Its full mask-assisted
+mode has separate local dependencies and requires already-downloaded SAM and
+Cutie weights; the command performs no intentional weight acquisition:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv sync --extra dev --extra roboflow --extra mcbyte --extra evaluation
+UV_CACHE_DIR=.uv-cache uv run python - <<'PY'
+import inspect
+import trackers
+print(inspect.signature(trackers.McByteTracker))
+print(inspect.signature(trackers.McByteMaskConfig))
+PY
+```
+
+For a controlled real-cache replay, first create and preserve a complete cache
+from a real detector run, then provide it explicitly. The shared cache is
+rejected if its source hash, checkpoint hash, detector settings, player class
+mapping, proxy provenance, or native-frame coverage differs.
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
+  --input data/all-22-lions-rams-sample.mp4 \
+  --output artifacts/mcbyte-evaluation/mcbyte-mask-on \
+  --detection-cache artifacts/frozen-real-detections.jsonl \
+  --detector rfdetr --detector-checkpoint /path/to/football-rfdetr.pth \
+  --detector-class-mapping /path/to/detector-class-mapping.json \
+  --tracker mcbyte --mcbyte-masks on --mcbyte-device cpu \
+  --mcbyte-sam-checkpoint /path/to/sam_vit_b_01ec64.pth \
+  --mcbyte-cutie-checkpoint /path/to/cutie-base-mega.pth \
+  --reviewed-reference /path/to/reviewed-mot-reference.json \
+  --manual-cut 712
+```
+
+`--mcbyte-masks off` records the supported McByte ablation. A run with masks
+disabled after runtime fallback is labeled degraded and cannot satisfy the
+mask-active gate. Without `--reviewed-reference`, `tracking-evaluation.json`
+states `not_evaluated`; no overlay or track count is treated as identity truth.
+The class-mapping file is a non-empty JSON object, for example
+`{"1": "person"}` for the generic checkpoint, and is compared exactly with
+the cache provenance before replay.
+
+## Memory guard
+
+Every run has a 2048 MiB host-process peak-RSS budget by default. It samples
+after backend initialization, during native-frame tracking, and after export;
+crossing the budget stops the run with an explicit error and records the peak
+and stage samples in `metrics.json` for completed runs. Use a lower explicit
+budget when working on a constrained machine:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
+  --input data/all-22-lions-rams-sample.mp4 \
+  --output artifacts/memory-guarded \
+  --detector synthetic --tracker iou --max-memory-mb 1024
+```
+
+This guards host RSS, not an allocator request that may fail inside CUDA or
+MPS before Python regains control. Keep McByte on its default explicit `cpu`
+device unless accelerator capacity has been checked, and use a lower source
+resolution or a smaller mask configuration when a full mask run exceeds the
+budget.
+
 Run the real RF-DETR/BoT-SORT path with a local checkpoint. The command below uses the generic Roboflow pretrained RF-DETR Small weights as an integration smoke test; a football-fine-tuned checkpoint should be supplied for production tracking:
 
 ```bash

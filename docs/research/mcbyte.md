@@ -1,6 +1,6 @@
 # McByte integration research
 
-Checked 2026-09-12. This is source inspection and upstream evidence, not a local tracking result. The proposed evaluation is in [the evaluation plan](../mcbyte-evaluation-plan.md).
+Checked 2026-09-12. This is source inspection and upstream evidence, not a local tracking result. The proposed evaluation is in [the evaluation plan](../mcbyte-evaluation-plan.md). The project now has an opt-in adapter and strict replay/evaluation plumbing; its local evidence state is recorded in [the McByte evidence handoff](../evidence/mcbyte-evaluation.md). That plumbing does not establish a real mask-active run or football identity improvement.
 
 ## Version to target
 
