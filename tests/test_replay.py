@@ -62,3 +62,41 @@ def test_alignment_requires_review_two_shots_and_positive_fps(tmp_path) -> None:
 
     with pytest.raises(ValueError):
         alignment.play_time_s("shot-0", 120, 0.0)
+
+
+def test_load_play_alignment_rejects_malformed_anchors(tmp_path) -> None:
+    # Test negative source_frame
+    negative_frame = tmp_path / "negative_frame.json"
+    negative_frame.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": -1, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 820, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+    with pytest.raises(ReplayAlignmentError):
+        load_play_alignment(negative_frame)
+
+    # Test non-numeric source_frame
+    non_numeric_frame = tmp_path / "non_numeric_frame.json"
+    non_numeric_frame.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": "abc", "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 820, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+    with pytest.raises(ReplayAlignmentError):
+        load_play_alignment(non_numeric_frame)
+
+    # Test empty event string
+    empty_event = tmp_path / "empty_event.json"
+    empty_event.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 120, "event": ""},
+            {"shot_id": "shot-1", "source_frame": 820, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+    with pytest.raises(ReplayAlignmentError):
+        load_play_alignment(empty_event)

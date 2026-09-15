@@ -70,5 +70,8 @@ def load_play_alignment(path: str | Path) -> PlayAlignment:
         if shot_id in seen:
             raise ReplayAlignmentError(f"duplicate anchor for {shot_id}")
         seen.add(shot_id)
-        anchors.append(PlayAnchor(shot_id, int(raw["source_frame"]), str(raw.get("event", "snap"))))
+        try:
+            anchors.append(PlayAnchor(shot_id, int(raw["source_frame"]), str(raw.get("event", "snap"))))
+        except (TypeError, ValueError) as error:
+            raise ReplayAlignmentError(f"invalid anchor for {shot_id}: {error}") from error
     return PlayAlignment(play_id, tuple(sorted(anchors, key=lambda anchor: anchor.shot_id)))
