@@ -942,10 +942,13 @@ def test_run_abstains_without_calibration_and_records_the_reason(tmp_path) -> No
     review = json.loads((output / "review.json").read_text(encoding="utf-8"))
     assert review["cross_view_identity_resolved"] is False
 
-    observations = (output / "observations.csv").read_text(encoding="utf-8").splitlines()
-    header = observations[0].split(",")
-    play_id_column = header.index("play_id")
-    assert observations[1].split(",")[play_id_column] == "play-1"
+    # Parse with DictReader like every other CSV assertion in this file: the
+    # time_base column precedes play_id and serialises as "[1,10240]", so a
+    # naive split(",") on a data row shifts every later column by one.
+    with (output / "observations.csv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    assert {row["play_id"] for row in rows} == {"play-1"}
 
 
 def test_run_rejects_unreviewed_play_alignment(tmp_path) -> None:
