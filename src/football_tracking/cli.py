@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -15,10 +16,11 @@ from .cache import CacheMismatch, DetectionCache
 from .calibration import Homography, load_calibrations, project_observation
 from .detector import Detection, RFDETRDetector, SyntheticDetector
 from .export import StageTimer, render_annotated_video, write_calibration_json, write_field_view, write_identities_json, write_manifest_json, write_metrics_json, write_observations_csv, write_observations_parquet, write_review_json, write_trajectories_csv
-from .identity import IdentityLink, TrackletSummary, resolve_teams, stable_anonymous_ids, team_feature_from_crop
-from .evaluation import EvaluationError, evaluate_tracking, load_reviewed_mot_reference
+from .identity import IdentityLink, TrackletSummary, match_tracklets, resolve_teams, stable_anonymous_ids, team_feature_from_crop
+from .evaluation import EvaluationError, evaluate_cross_shot_identity, evaluate_tracking, load_cross_shot_identity, load_reviewed_mot_reference
 from .metrics import config_hash, package_version, sha256_file, summarize_tracks, system_info
 from .memory import MemoryBudget
+from .replay import FieldTrack, PlayAlignment, ReplayAlignmentError, cross_shot_candidate_scores, load_play_alignment
 from .schema import Observation, RunManifest
 from .tracking import IoUTracker, McByteTracker, RoboflowTracker, TrackObservation, TrackerAdapter
 from .video import ShotBoundary, VideoInfo, detect_shots, iter_video_frames, shot_ranges
@@ -62,6 +64,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reviewed-reference", type=Path, default=None, help="reviewed MOT-style reference JSON; required for quality scoring")
     parser.add_argument("--team-prototypes", type=Path, default=None, help="JSON object mapping team names to RGB triples")
     parser.add_argument("--calibration", type=Path, default=None, help="JSON with image_points and field_points arrays")
+    parser.add_argument("--play-alignment", type=Path, default=None, help="reviewed snap-anchor JSON enabling constrained cross-shot identity joins")
 
 
 def _add_cache_arguments(parser: argparse.ArgumentParser) -> None:
@@ -230,6 +233,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     info = VideoInfo.from_path(source)
     boundaries = _boundaries_for_video(info, args.manual_cut)
     ranges = shot_ranges(info.frame_count, boundaries)
+    alignment: PlayAlignment | None = load_play_alignment(args.play_alignment) if args.play_alignment else None
     source_hash = sha256_file(source)
     checkpoint_hash = sha256_file(args.detector_checkpoint) if args.detector_checkpoint and Path(args.detector_checkpoint).is_file() else None
     tracker_config = {
@@ -339,32 +343,19 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     teams = resolve_teams(summaries, prototypes=team_prototypes)
     identity_links: list[IdentityLink] = []
     link_report: dict[str, Any] = {"status": "not_attempted", "reason": "--play-alignment was not provided"}
-    identity_map = stable_anonymous_ids(tracklet_ids, identity_links)
-    by_player: dict[str, set[str]] = {}
-    for tracklet_id, player_id in identity_map.items():
-        by_player.setdefault(player_id, set()).add(tracklet_id.split(":", 1)[0])
-    link_report.update({
-        "shot_count": len(boundaries),
-        "tracklet_count": len(tracklet_ids),
-        "player_id_count": len(set(identity_map.values())),
-        "cross_shot_player_ids": sum(1 for shots in by_player.values() if len(shots) > 1),
-        "links": [
-            {"left_key": link.left_key, "right_key": link.right_key, "decision": link.decision, "score": link.score}
-            for link in identity_links
-        ],
-    })
     calibrations = _load_calibrations(args.calibration)
     observations: list[Observation] = []
     for row in raw_tracks:
         evidence = teams.get(row.tracklet_id)
+        shot_id = row.tracklet_id.split(":", 1)[0]
         observation = Observation(
             run_id=run_id,
-            shot_id=row.tracklet_id.split(":", 1)[0],
+            shot_id=shot_id,
             frame_index=row.frame_index,
             pts=row.pts,
             time_base=info.time_base,
             tracklet_id=row.tracklet_id,
-            player_id=identity_map.get(row.tracklet_id),
+            player_id=None,
             bbox_xyxy_px=row.bbox_xyxy_px,
             detection_score=row.score,
             team=evidence.team if evidence else "unknown",
@@ -374,11 +365,64 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             position_source=None,
             calibration_id=None,
             identity_version=1,
+            play_id=alignment.play_id if alignment and shot_id in alignment.shots() else None,
         )
         homography = calibrations.get(observation.shot_id) or calibrations.get("*")
         if homography is not None:
             observation = project_observation(observation, homography)
         observations.append(observation)
+    if alignment is not None:
+        field_tracks: dict[str, list[FieldTrack]] = {}
+        samples: dict[str, list[tuple[float, float, float]]] = {}
+        for observation in observations:
+            if observation.field_xy_yards is None:
+                continue
+            play_time = alignment.play_time_s(observation.shot_id, observation.frame_index, info.source_fps)
+            if play_time is None:
+                continue
+            samples.setdefault(observation.tracklet_id, []).append((play_time, *observation.field_xy_yards))
+        for tracklet_id, rows in samples.items():
+            shot_id = tracklet_id.split(":", 1)[0]
+            field_tracks.setdefault(shot_id, []).append(FieldTrack(tracklet_id, shot_id, tuple(sorted(rows))))
+        aligned_shots = [shot for shot in alignment.shots() if field_tracks.get(shot)]
+        if len(aligned_shots) < 2:
+            link_report = {"status": "abstained", "reason": "no calibrated field positions for the aligned shots"}
+        else:
+            left_shot, right_shot = aligned_shots[0], aligned_shots[1]
+            candidate_scores = cross_shot_candidate_scores(field_tracks[left_shot], field_tracks[right_shot], teams)
+            identity_links = match_tracklets(
+                [track.tracklet_id for track in field_tracks[left_shot]],
+                [track.tracklet_id for track in field_tracks[right_shot]],
+                candidate_scores,
+            )
+            accepted = [link for link in identity_links if link.decision == "same"]
+            link_report = {
+                "status": "resolved" if accepted else "abstained",
+                "reason": "constrained cross-shot match" if accepted else "no candidate pair cleared the threshold and margin",
+                "play_id": alignment.play_id,
+                "left_shot": left_shot,
+                "right_shot": right_shot,
+                "candidate_pairs": len(candidate_scores),
+                "accepted_links": len(accepted),
+            }
+    identity_map = stable_anonymous_ids(tracklet_ids, identity_links)
+    observations = [
+        replace(observation, player_id=identity_map.get(observation.tracklet_id))
+        for observation in observations
+    ]
+    by_player: dict[str, set[str]] = {}
+    for tracklet_id, player_id in identity_map.items():
+        by_player.setdefault(player_id, set()).add(tracklet_id.split(":", 1)[0])
+    link_report.update({
+        "shot_count": len(boundaries),
+        "tracklet_count": len(tracklet_ids),
+        "player_id_count": len(set(identity_map.values())),
+        "cross_shot_player_ids": sum(1 for shots in by_player.values() if len(shots) > 1),
+        "links": [
+            {"left_key": link.left_key, "right_key": link.right_key, "decision": link.decision, "score": link.score, "evidence_keys": list(link.evidence_keys)}
+            for link in identity_links
+        ],
+    })
     with timer.stage("export"):
         write_observations_csv(destination / "observations.csv", observations)
         write_observations_parquet(destination / "observations.parquet", observations)
@@ -392,7 +436,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 trajectories.setdefault(observation.player_id, []).append(observation.field_xy_yards)
         write_field_view(destination / "field-view.png", trajectories)
         write_calibration_json(destination / "calibration.json", calibrations)
-        write_review_json(destination / "review.json", {"status": "unresolved_cross_view", "shot_count": len(boundaries), "cross_view_identity_resolved": False, "notes": ["Replay relationship remains unresolved unless manually aligned and linked.", "Generic or proxy detector identities are not roster identities."]})
+        resolved = link_report.get("status") == "resolved"
+        write_review_json(destination / "review.json", {
+            "status": "resolved_cross_view" if resolved else "unresolved_cross_view",
+            "shot_count": len(boundaries),
+            "cross_view_identity_resolved": resolved,
+            "cross_shot_links": link_report.get("accepted_links", 0),
+            "notes": [
+                "Replay relationship remains unresolved unless manually aligned and linked.",
+                "Generic or proxy detector identities are not roster identities.",
+            ],
+        })
         render_annotated_video(source, destination / "annotated.mp4", observations, boundaries)
     memory_budget.sample("export_complete")
     quality_report: dict[str, Any]
@@ -403,6 +457,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             quality_report = evaluate_tracking(raw_tracks, load_reviewed_mot_reference(args.reviewed_reference))
             quality_report["reference_path"] = str(args.reviewed_reference)
             quality_report["reference_sha256"] = sha256_file(args.reviewed_reference)
+            quality_report["cross_shot"] = evaluate_cross_shot_identity(
+                identity_map,
+                raw_tracks,
+                load_reviewed_mot_reference(args.reviewed_reference),
+                load_cross_shot_identity(args.reviewed_reference),
+            )
         except EvaluationError as error:
             quality_report = {"status": "not_evaluated", "reason": f"{type(error).__name__}: {error}"}
     write_metrics_json(destination / "tracking-evaluation.json", quality_report)
@@ -569,6 +629,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = merge_cache_chunks(args)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
-    except (FileNotFoundError, MemoryError, RuntimeError, ValueError, KeyError) as error:
+    except (FileNotFoundError, MemoryError, RuntimeError, ValueError, KeyError, ReplayAlignmentError) as error:
         print(f"football-tracking: {type(error).__name__}: {error}", file=sys.stderr)
         return 2

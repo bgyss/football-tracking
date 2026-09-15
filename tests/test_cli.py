@@ -110,3 +110,56 @@ def test_run_emits_identity_links_evidence_and_defaults_to_unlinked(tmp_path) ->
     assert report["links"] == []
     assert report["cross_shot_player_ids"] == 0
     assert report["player_id_count"] == report["tracklet_count"]
+
+
+def test_run_abstains_without_calibration_and_records_the_reason(tmp_path) -> None:
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
+
+    alignment = tmp_path / "alignment.json"
+    alignment.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 2, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+
+    output = tmp_path / "run"
+    exit_code = main([
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
+        "--play-alignment", str(alignment),
+    ])
+    assert exit_code == 0
+
+    report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    assert report["status"] == "abstained"
+    assert report["reason"] == "no calibrated field positions for the aligned shots"
+    assert report["cross_shot_player_ids"] == 0
+
+    review = json.loads((output / "review.json").read_text(encoding="utf-8"))
+    assert review["cross_view_identity_resolved"] is False
+
+    # Parse with DictReader like every other CSV assertion in this file: the
+    # time_base column precedes play_id and serialises as "[1,10240]", so a
+    # naive split(",") on a data row shifts every later column by one.
+    with (output / "observations.csv").open(encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows
+    assert {row["play_id"] for row in rows} == {"play-1"}
+
+
+def test_run_rejects_unreviewed_play_alignment(tmp_path) -> None:
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
+
+    alignment = tmp_path / "alignment.json"
+    alignment.write_text(json.dumps({"play_id": "play-1", "anchors": []}), encoding="utf-8")
+
+    exit_code = main([
+        "run", "--input", str(input_path), "--output", str(tmp_path / "run"),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
+        "--play-alignment", str(alignment),
+    ])
+    assert exit_code == 2
