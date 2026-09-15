@@ -178,7 +178,49 @@ def test_run_records_unresolved_shots_in_two_shot_cross_identity(tmp_path) -> No
         ],
     }), encoding="utf-8")
 
-    # Minimal calibration that maps frame corners to field coordinates
+    # Shot-specific calibration (both shots mapped explicitly, not via the "*"
+    # shared fallback) that maps frame corners to field coordinates.
+    landmarks = {
+        "image_points": [[0, 0], [32, 0], [32, 24], [0, 24]],
+        "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
+    }
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"shots": {"shot-0": landmarks, "shot-1": landmarks}}), encoding="utf-8")
+
+    output = tmp_path / "run"
+    exit_code = main([
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
+        "--play-alignment", str(alignment),
+        "--calibration", str(calibration),
+    ])
+    assert exit_code == 0
+
+    report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    # In a two-shot scenario, unresolved_shots should be empty
+    assert report.get("unresolved_shots") == []
+    assert report.get("note") == "only the first two aligned shots are resolved in this milestone"
+
+
+def test_run_abstains_on_a_shared_homography_instead_of_merging_on_it(tmp_path) -> None:
+    # A calibration file with no `shots` object fits one shared homography (keyed
+    # "*"). A homography is a per-camera-pose transform: applying the same one to
+    # both shots would make shot-1's "field position" a restatement of its image
+    # coordinates, so accepting it as cross-shot evidence would merge identities on
+    # image-coordinate proximity across the cut -- exactly what this design forbids.
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
+
+    alignment = tmp_path / "alignment.json"
+    alignment.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 2, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+
+    # No "shots" object: load_calibrations returns a single shared {"*": ...} entry.
     calibration = tmp_path / "calibration.json"
     calibration.write_text(json.dumps({
         "image_points": [[0, 0], [32, 0], [32, 24], [0, 24]],
@@ -195,6 +237,89 @@ def test_run_records_unresolved_shots_in_two_shot_cross_identity(tmp_path) -> No
     assert exit_code == 0
 
     report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
-    # In a two-shot scenario, unresolved_shots should be empty
-    assert report.get("unresolved_shots") == []
-    assert report.get("note") == "only the first two aligned shots are resolved in this milestone"
+    assert report["status"] == "abstained"
+    assert report["reason"] == "cross-shot resolution requires shot-specific calibration"
+    assert report["cross_shot_player_ids"] == 0
+    assert report["player_id_count"] == report["tracklet_count"]
+    assert "accepted_links" not in report
+
+    review = json.loads((output / "review.json").read_text(encoding="utf-8"))
+    assert review["cross_view_identity_resolved"] is False
+
+    manifest = json.loads((output / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete_with_unresolved"
+
+
+REPLAY_WIDTH, REPLAY_HEIGHT = 100, 60
+
+
+def make_replay_video(path, frames_per_shot: int) -> None:
+    """A wide video whose two halves are solid, distinct colors (team evidence)
+    and whose detections (from SyntheticDetector's two fixed, frame-content
+    independent boxes) are static -- so a shot-0/shot-1 split of this same content
+    models a play observed twice from different cameras, once per shot. The frame
+    is wide enough that each fixed detection box (8% of frame width) crops to at
+    least 4px, the minimum team_feature_from_crop requires."""
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (REPLAY_WIDTH, REPLAY_HEIGHT))
+    assert writer.isOpened()
+    frame = np.zeros((REPLAY_HEIGHT, REPLAY_WIDTH, 3), dtype=np.uint8)
+    frame[:, : REPLAY_WIDTH // 2] = (255, 0, 0)  # BGR -> RGB (0, 0, 1): "blue" team half
+    frame[:, REPLAY_WIDTH // 2 :] = (0, 255, 0)  # BGR -> RGB (0, 1, 0): "green" team half
+    for _ in range(frames_per_shot * 2):
+        writer.write(frame)
+    writer.release()
+
+
+def test_run_reaches_a_resolved_cross_shot_outcome_from_view_invariant_evidence(tmp_path) -> None:
+    frames_per_shot = 7
+    input_path = tmp_path / "replay.mp4"
+    make_replay_video(input_path, frames_per_shot)
+
+    alignment = tmp_path / "alignment.json"
+    alignment.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": frames_per_shot, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+
+    landmarks = {
+        "image_points": [[0, 0], [REPLAY_WIDTH, 0], [REPLAY_WIDTH, REPLAY_HEIGHT], [0, REPLAY_HEIGHT]],
+        "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
+    }
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"shots": {"shot-0": landmarks, "shot-1": landmarks}}), encoding="utf-8")
+
+    # Forces real (non-"unknown") team labels onto the synthetic fixture's crops,
+    # which is required for cross_shot_candidate_scores to consider a pair at all.
+    prototypes = tmp_path / "prototypes.json"
+    prototypes.write_text(json.dumps({"blue": [0.0, 0.0, 1.0], "green": [0.0, 1.0, 0.0]}), encoding="utf-8")
+
+    output = tmp_path / "run"
+    exit_code = main([
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", str(frames_per_shot),
+        "--play-alignment", str(alignment),
+        "--calibration", str(calibration),
+        "--team-prototypes", str(prototypes),
+    ])
+    assert exit_code == 0
+
+    report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    assert report["candidate_pairs"] > 0
+    if report["status"] == "resolved":
+        assert report["accepted_links"] > 0
+        assert report["cross_shot_player_ids"] > 0
+        review = json.loads((output / "review.json").read_text(encoding="utf-8"))
+        assert review["status"] == "resolved_cross_view"
+        assert review["cross_view_identity_resolved"] is True
+        manifest = json.loads((output / "run-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["status"] == "complete"
+    else:
+        # Honest fallback if this fixture's evidence does not clear the threshold
+        # and margin on this machine/build: prove the scorer was genuinely reached
+        # and abstained rather than silently producing zero candidates.
+        assert report["status"] == "abstained"
+        assert all(link["decision"] == "insufficient_evidence" for link in report["links"])

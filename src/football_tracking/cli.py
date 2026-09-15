@@ -389,24 +389,31 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             link_report = {"status": "abstained", "reason": "no calibrated field positions for the aligned shots"}
         else:
             left_shot, right_shot = aligned_shots[0], aligned_shots[1]
-            candidate_scores = cross_shot_candidate_scores(field_tracks[left_shot], field_tracks[right_shot], teams)
-            identity_links = match_tracklets(
-                [track.tracklet_id for track in field_tracks[left_shot]],
-                [track.tracklet_id for track in field_tracks[right_shot]],
-                candidate_scores,
-            )
-            accepted = [link for link in identity_links if link.decision == "same"]
-            link_report = {
-                "status": "resolved" if accepted else "abstained",
-                "reason": "constrained cross-shot match" if accepted else "no candidate pair cleared the threshold and margin",
-                "play_id": alignment.play_id,
-                "left_shot": left_shot,
-                "right_shot": right_shot,
-                "unresolved_shots": aligned_shots[2:],
-                "note": "only the first two aligned shots are resolved in this milestone",
-                "candidate_pairs": len(candidate_scores),
-                "accepted_links": len(accepted),
-            }
+            if left_shot not in calibrations or right_shot not in calibrations:
+                # A "*" shared-homography fallback is not shot-specific: applying one
+                # camera pose's transform to another shot would make "field position"
+                # a restatement of image coordinates, which is exactly the
+                # image-coordinate merging this design forbids across a cut.
+                link_report = {"status": "abstained", "reason": "cross-shot resolution requires shot-specific calibration"}
+            else:
+                candidate_scores = cross_shot_candidate_scores(field_tracks[left_shot], field_tracks[right_shot], teams)
+                identity_links = match_tracklets(
+                    [track.tracklet_id for track in field_tracks[left_shot]],
+                    [track.tracklet_id for track in field_tracks[right_shot]],
+                    candidate_scores,
+                )
+                accepted = [link for link in identity_links if link.decision == "same"]
+                link_report = {
+                    "status": "resolved" if accepted else "abstained",
+                    "reason": "constrained cross-shot match" if accepted else "no candidate pair cleared the threshold and margin",
+                    "play_id": alignment.play_id,
+                    "left_shot": left_shot,
+                    "right_shot": right_shot,
+                    "unresolved_shots": aligned_shots[2:],
+                    "note": "only the first two aligned shots are resolved in this milestone",
+                    "candidate_pairs": len(candidate_scores),
+                    "accepted_links": len(accepted),
+                }
     identity_map = stable_anonymous_ids(tracklet_ids, identity_links)
     observations = [
         replace(observation, player_id=identity_map.get(observation.tracklet_id))
@@ -432,10 +439,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         write_identities_json(destination / "identities.json", identity_map)
         write_metrics_json(destination / "identity-links.json", link_report)
         write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges})
-        trajectories: dict[str, list[tuple[float, float]]] = {}
+        trajectories: dict[tuple[str, str], list[tuple[float, float]]] = {}
         for observation in observations:
             if observation.player_id and observation.field_xy_yards is not None:
-                trajectories.setdefault(observation.player_id, []).append(observation.field_xy_yards)
+                trajectories.setdefault((observation.player_id, observation.shot_id), []).append(observation.field_xy_yards)
         write_field_view(destination / "field-view.png", trajectories)
         write_calibration_json(destination / "calibration.json", calibrations)
         resolved = link_report.get("status") == "resolved"
@@ -445,7 +452,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "cross_view_identity_resolved": resolved,
             "cross_shot_links": link_report.get("accepted_links", 0),
             "notes": [
-                "Replay relationship remains unresolved unless manually aligned and linked.",
+                "Replay relationship resolved: identity-links.json records the accepted cross-shot"
+                " tracklet pairs from the reviewed play alignment."
+                if resolved
+                else "Replay relationship remains unresolved unless manually aligned and linked.",
                 "Generic or proxy detector identities are not roster identities.",
             ],
         })
@@ -468,7 +478,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         except EvaluationError as error:
             quality_report = {"status": "not_evaluated", "reason": f"{type(error).__name__}: {error}"}
     write_metrics_json(destination / "tracking-evaluation.json", quality_report)
-    status = "complete_with_unresolved"
+    status = "complete" if resolved else "complete_with_unresolved"
     timer.timings["peak_rss_mb"] = memory_budget.peak_mb
     manifest = RunManifest(
         run_id=run_id,

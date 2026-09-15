@@ -137,7 +137,7 @@ UV_CACHE_DIR=.uv-cache uv run python -m football_tracking benchmark \
   --manual-cut 712
 ```
 
-The run writes `annotated.mp4`, `observations.csv`, `observations.parquet`, `identities.json`, `field-view.png`, `trajectories.csv`, `shots.json`, `calibration.json`, `review.json`, `metrics.json`, `run-manifest.json`, and the detector cache. `trajectories.csv` always contains image-space contact points; its yard columns are populated only with a valid shot-specific landmark file passed through `--calibration`. Image-space trails are always available in the annotated video.
+The run writes `annotated.mp4`, `observations.csv`, `observations.parquet`, `identities.json`, `field-view.png`, `trajectories.csv`, `shots.json`, `calibration.json`, `identity-links.json`, `review.json`, `metrics.json`, `run-manifest.json`, and the detector cache. `trajectories.csv` always contains image-space contact points; its yard columns are populated only with a valid shot-specific landmark file passed through `--calibration`. Image-space trails are always available in the annotated video.
 
 ## Local evidence from the supplied clip
 

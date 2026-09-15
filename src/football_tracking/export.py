@@ -211,7 +211,14 @@ def render_annotated_video(
         video_only.replace(destination)
 
 
-def write_field_view(path: str | Path, trajectories: Mapping[str, Sequence[Sequence[float]]]) -> None:
+def write_field_view(path: str | Path, trajectories: Mapping[tuple[str, str], Sequence[Sequence[float]]]) -> None:
+    """Render field-space trails, one polyline per (player_id, shot_id).
+
+    A player observed in two shots (e.g. a correct replay merge) draws two
+    separate polylines sharing one identity label, rather than one continuous
+    line joined by a spurious segment between shots — a play must never be
+    double-counted in the field view.
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     width, height = 1200, 560
@@ -223,7 +230,7 @@ def write_field_view(path: str | Path, trajectories: Mapping[str, Sequence[Seque
         x = margin_x + int(field_width * yard / 120.0)
         cv2.line(canvas, (x, margin_y), (x, margin_y + field_height), (180, 220, 180), 1)
         cv2.putText(canvas, str(yard), (x - 10, margin_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1, cv2.LINE_AA)
-    for player_id, points in sorted(trajectories.items()):
+    for (player_id, shot_id), points in sorted(trajectories.items()):
         normalized = [(float(point[0]), float(point[1])) for point in points if len(point) >= 2 and np.all(np.isfinite(point[:2]))]
         if not normalized:
             continue

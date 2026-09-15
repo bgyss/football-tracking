@@ -76,12 +76,41 @@ def test_annotated_video_resets_trails_at_shot_boundary(tmp_path) -> None:
 
 def test_field_view_and_stage_timer(tmp_path) -> None:
     output = tmp_path / "field.png"
-    write_field_view(output, {"P01": [(0.0, 1.0), (10.0, 5.0)]})
+    write_field_view(output, {("P01", "shot-0"): [(0.0, 1.0), (10.0, 5.0)]})
     timer = StageTimer()
     with timer.stage("unit"):
         pass
     assert output.stat().st_size > 0
     assert timer.timings["unit_s"] >= 0.0
+
+
+def test_field_view_draws_a_replay_merged_player_as_two_separate_paths(tmp_path) -> None:
+    # A player observed in both shots of a correct replay merge must be drawn as two
+    # independent trails, not one line joined across the cut by a spurious segment.
+    output_split = tmp_path / "field-split.png"
+    output_joined = tmp_path / "field-joined.png"
+
+    write_field_view(output_split, {
+        ("P01", "shot-0"): [(0.0, 1.0), (10.0, 1.0)],
+        ("P01", "shot-1"): [(80.0, 40.0), (90.0, 40.0)],
+    })
+    # The old behavior: one continuous path across both shots' points, in tracklet
+    # insertion order, would draw a segment bridging (10, 1) -> (80, 40).
+    write_field_view(output_joined, {("P01", "shot-0"): [(0.0, 1.0), (10.0, 1.0), (80.0, 40.0), (90.0, 40.0)]})
+
+    split = cv2.imread(str(output_split))
+    joined = cv2.imread(str(output_joined))
+    assert split is not None and joined is not None
+    # A pixel near the midpoint of the spurious bridging segment is painted in the
+    # joined rendering but must stay background-colored in the split rendering.
+    midpoint_yards = (45.0, 20.5)
+    margin_x, margin_y = 70, 60
+    field_width, field_height = 1200 - margin_x * 2, 560 - margin_y * 2
+    px = margin_x + int(field_width * midpoint_yards[0] / 120.0)
+    py = margin_y + field_height - int(field_height * midpoint_yards[1] / (160.0 / 3.0))
+    background = tuple(int(value) for value in (35, 105, 35))
+    assert tuple(int(value) for value in split[py, px]) == background
+    assert tuple(int(value) for value in joined[py, px]) != background
 
 
 def test_parquet_export_contains_observation_contract(tmp_path) -> None:

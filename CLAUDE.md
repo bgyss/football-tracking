@@ -54,8 +54,16 @@ export → evaluate → manifest.
   via SAM + Cutie, explicit device, `effective_mode()` reports runtime mask fallback).
   A fresh tracker is constructed per shot; tracklet ids are shot-local (`shot-N:tID`).
 - `identity.py` — color-histogram team evidence, constrained tracklet matching, and
-  union-find `stable_anonymous_ids`. Cross-view/replay linking is intentionally not
-  wired into the pipeline.
+  union-find `stable_anonymous_ids`.
+- `replay.py` — reviewed play-time alignment (`--play-alignment`, refuses anything not
+  explicitly marked `reviewed: true`) and cross-shot candidate scoring from
+  view-invariant evidence only (team agreement, calibrated field position at aligned
+  play time, trajectory shape). Cross-shot resolution runs when `--play-alignment`
+  supplies reviewed snap anchors and requires genuinely shot-specific calibration for
+  the two shots being resolved (a shared `"*"` homography does not qualify, since
+  applying one camera pose's transform to another shot would make "field position" a
+  restatement of image coordinates); otherwise it abstains. Every decision — resolved,
+  abstained, or not attempted — is recorded in `identity-links.json`.
 - `calibration.py` — homography fit from landmark JSON; without `--calibration` the yard
   columns stay empty and only image-space positions are exported.
 - `evaluation.py` — reviewed MOT-style reference import and HOTA/IDF1-style metrics.
@@ -68,8 +76,8 @@ export → evaluate → manifest.
 
 Each `run` writes a fixed artifact set to `--output`: `annotated.mp4`,
 `observations.csv`/`.parquet`, `trajectories.csv`, `identities.json`, `field-view.png`,
-`shots.json`, `calibration.json`, `review.json`, `tracking-evaluation.json`,
-`metrics.json`, `run-manifest.json`, `detections.jsonl`.
+`shots.json`, `calibration.json`, `identity-links.json`, `review.json`,
+`tracking-evaluation.json`, `metrics.json`, `run-manifest.json`, `detections.jsonl`.
 
 ## Project conventions
 
