@@ -385,14 +385,21 @@ Makes the current state visible in artifacts without changing it, so "IDs did no
 
 Append to `tests/test_cli.py`:
 
+`tests/test_cli.py` already has a `make_video(path)` helper that writes a 4-frame
+32x24 clip, and every pipeline test in that file uses it. Do the same — the real
+sample is gitignored and far too slow for the suite. `--manual-cut 2` on the
+4-frame fixture yields `shot-0` and `shot-1`, which is what makes a cross-shot
+assertion meaningful. Add `import json` to the file's imports.
+
 ```python
 def test_run_emits_identity_links_evidence_and_defaults_to_unlinked(tmp_path) -> None:
-    from football_tracking.cli import main
-
+    input_path = tmp_path / "tiny.mp4"
     output = tmp_path / "run"
+    make_video(input_path)
+
     exit_code = main([
-        "run", "--input", "data/all-22-lions-rams-sample.mp4", "--output", str(output),
-        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "712",
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
     ])
     assert exit_code == 0
 
@@ -902,21 +909,22 @@ Append to `tests/test_cli.py`:
 
 ```python
 def test_run_abstains_without_calibration_and_records_the_reason(tmp_path) -> None:
-    from football_tracking.cli import main
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
 
     alignment = tmp_path / "alignment.json"
     alignment.write_text(json.dumps({
         "reviewed": True, "play_id": "play-1",
         "anchors": [
-            {"shot_id": "shot-0", "source_frame": 120, "event": "snap"},
-            {"shot_id": "shot-1", "source_frame": 820, "event": "snap"},
+            {"shot_id": "shot-0", "source_frame": 0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 2, "event": "snap"},
         ],
     }), encoding="utf-8")
 
     output = tmp_path / "run"
     exit_code = main([
-        "run", "--input", "data/all-22-lions-rams-sample.mp4", "--output", str(output),
-        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "712",
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
         "--play-alignment", str(alignment),
     ])
     assert exit_code == 0
@@ -936,14 +944,15 @@ def test_run_abstains_without_calibration_and_records_the_reason(tmp_path) -> No
 
 
 def test_run_rejects_unreviewed_play_alignment(tmp_path) -> None:
-    from football_tracking.cli import main
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
 
     alignment = tmp_path / "alignment.json"
     alignment.write_text(json.dumps({"play_id": "play-1", "anchors": []}), encoding="utf-8")
 
     exit_code = main([
-        "run", "--input", "data/all-22-lions-rams-sample.mp4", "--output", str(tmp_path / "run"),
-        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "712",
+        "run", "--input", str(input_path), "--output", str(tmp_path / "run"),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
         "--play-alignment", str(alignment),
     ])
     assert exit_code == 2
