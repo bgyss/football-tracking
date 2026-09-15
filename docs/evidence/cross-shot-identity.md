@@ -1,6 +1,6 @@
 # Cross-shot identity: measured state and blocked gates
 
-Commit: `db2475b` (branch `feat/cross-shot-identity`, tip at the time this document was written).
+Branch: `feat/cross-shot-identity`. Implementation planned in `docs/superpowers/plans/2026-09-14-cross-shot-identity.md`.
 
 Command used to regenerate the evidence cited below:
 

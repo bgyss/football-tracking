@@ -179,16 +179,22 @@ def test_scores_are_bounded_and_deterministic() -> None:
 
 
 def test_paired_samples_enforces_exclusivity_of_right_matches() -> None:
-    # Left track: ten samples clustered around time 0.0 (start=0.0, step=0.1).
+    # Left track: six samples clustered around time 0.0 (start=0.0, step=0.01),
+    # giving times 0.00, 0.01, 0.02, 0.03, 0.04, 0.05.
     # Right track: one sample at time 0.0.
-    # Without exclusivity, all ten left samples could match the single right sample,
-    # inflating pair count and passing the min_overlap_samples floor.
+    # With sample_tolerance_s=0.05, all six left samples are within tolerance.
+    # Without exclusivity, all six left samples claim the right sample,
+    # yielding six pairs, which passes the min_overlap_samples=5 floor.
     # With exclusivity, only one left sample claims the right sample, yielding
-    # exactly one pair, which fails the min_overlap_samples gate.
-    left = [line("shot-0:t1", "shot-0", 10.0, 20.0, count=10, start=0.0, step=0.05)]
+    # one pair, which fails the min_overlap_samples gate.
+    # This fixture discriminates: exclusive and non-exclusive pairing produce
+    # opposite outcomes relative to the floor.
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0, count=6, start=0.0, step=0.01)]
     right = [line("shot-1:t1", "shot-1", 10.0, 20.0, count=1, start=0.0, step=0.1)]
     evidence = teams(**{"shot-0:t1": "DET", "shot-1:t1": "DET"})
 
-    # With default min_overlap_samples=5, a single pair should fail the gate.
+    # With default min_overlap_samples=5, exclusive pairing yields one pair and
+    # fails the gate; non-exclusive would yield six and pass. A regression
+    # reintroducing sample reuse would make this test fail.
     scores = cross_shot_candidate_scores(left, right, evidence)
     assert ("shot-0:t1", "shot-1:t1") not in scores
