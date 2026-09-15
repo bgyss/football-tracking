@@ -751,8 +751,13 @@ def test_opposing_trajectory_shape_scores_below_matching_shape() -> None:
     ]
     evidence = teams(**{"shot-0:t1": "DET", "shot-1:same": "DET", "shot-1:reverse": "DET"})
 
-    scores = cross_shot_candidate_scores(left, right, evidence)
+    # The reversed track ends up a mean 9.0 yards away, past the default gate,
+    # so by the hard-constraint rule it is not a candidate at all.
+    default_gate = cross_shot_candidate_scores(left, right, evidence)
+    assert ("shot-0:t1", "shot-1:reverse") not in default_gate
 
+    # Widen the gate so both pairs are scored, and the shape term is what separates them.
+    scores = cross_shot_candidate_scores(left, right, evidence, max_field_distance_yards=20.0)
     assert scores[("shot-0:t1", "shot-1:same")] > scores[("shot-0:t1", "shot-1:reverse")]
 
 
