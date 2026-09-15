@@ -100,3 +100,79 @@ def test_load_play_alignment_rejects_malformed_anchors(tmp_path) -> None:
     }), encoding="utf-8")
     with pytest.raises(ReplayAlignmentError):
         load_play_alignment(empty_event)
+
+
+from football_tracking.identity import TeamEvidence
+from football_tracking.replay import FieldTrack, cross_shot_candidate_scores
+
+
+def line(tracklet_id, shot_id, x0, y0, *, dx=1.0, count=10, start=0.0, step=0.1):
+    return FieldTrack(
+        tracklet_id, shot_id,
+        tuple((start + index * step, x0 + index * dx, y0) for index in range(count)),
+    )
+
+
+def teams(**assignment):
+    return {key: TeamEvidence(value, 0.95, "rgb_prototype", 20) for key, value in assignment.items()}
+
+
+def test_matching_field_motion_scores_high_and_distant_motion_is_dropped() -> None:
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0), line("shot-0:t2", "shot-0", 60.0, 40.0)]
+    right = [line("shot-1:t1", "shot-1", 10.0, 20.0), line("shot-1:t2", "shot-1", 60.0, 40.0)]
+    evidence = teams(**{
+        "shot-0:t1": "DET", "shot-0:t2": "LAR", "shot-1:t1": "DET", "shot-1:t2": "LAR",
+    })
+
+    scores = cross_shot_candidate_scores(left, right, evidence)
+
+    assert scores[("shot-0:t1", "shot-1:t1")] > 0.9
+    assert scores[("shot-0:t2", "shot-1:t2")] > 0.9
+    # 50 yards apart, well beyond max_field_distance_yards: no candidate at all.
+    assert ("shot-0:t1", "shot-1:t2") not in scores
+
+
+def test_team_conflict_and_thin_overlap_produce_no_candidate() -> None:
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0)]
+    right = [line("shot-1:t1", "shot-1", 10.0, 20.0)]
+
+    conflicting = teams(**{"shot-0:t1": "DET", "shot-1:t1": "LAR"})
+    assert cross_shot_candidate_scores(left, right, conflicting) == {}
+
+    unknown = teams(**{"shot-0:t1": "unknown", "shot-1:t1": "DET"})
+    assert cross_shot_candidate_scores(left, right, unknown) == {}
+
+    thin_left = [line("shot-0:t1", "shot-0", 10.0, 20.0, count=3)]
+    thin_right = [line("shot-1:t1", "shot-1", 10.0, 20.0, count=3)]
+    agreeing = teams(**{"shot-0:t1": "DET", "shot-1:t1": "DET"})
+    assert cross_shot_candidate_scores(thin_left, thin_right, agreeing) == {}
+
+
+def test_opposing_trajectory_shape_scores_below_matching_shape() -> None:
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0, dx=1.0)]
+    right = [
+        line("shot-1:same", "shot-1", 10.0, 20.0, dx=1.0),
+        line("shot-1:reverse", "shot-1", 10.0, 20.0, dx=-1.0),
+    ]
+    evidence = teams(**{"shot-0:t1": "DET", "shot-1:same": "DET", "shot-1:reverse": "DET"})
+
+    # The reversed track ends up a mean 9.0 yards away, past the default gate,
+    # so by the hard-constraint rule it is not a candidate at all.
+    default_gate = cross_shot_candidate_scores(left, right, evidence)
+    assert ("shot-0:t1", "shot-1:reverse") not in default_gate
+
+    # Widen the gate so both pairs are scored, and the shape term is what separates them.
+    scores = cross_shot_candidate_scores(left, right, evidence, max_field_distance_yards=20.0)
+    assert scores[("shot-0:t1", "shot-1:same")] > scores[("shot-0:t1", "shot-1:reverse")]
+
+
+def test_scores_are_bounded_and_deterministic() -> None:
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0)]
+    right = [line("shot-1:t1", "shot-1", 10.4, 20.3)]
+    evidence = teams(**{"shot-0:t1": "DET", "shot-1:t1": "DET"})
+
+    first = cross_shot_candidate_scores(left, right, evidence)
+    second = cross_shot_candidate_scores(left, right, evidence)
+
+    assert first == second
+    assert all(0.0 <= value <= 1.0 for value in first.values())

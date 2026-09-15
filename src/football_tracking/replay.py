@@ -10,6 +10,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping, Sequence
+
+import numpy as np
+
+from .identity import TeamEvidence
 
 
 class ReplayAlignmentError(ValueError):
@@ -75,3 +80,98 @@ def load_play_alignment(path: str | Path) -> PlayAlignment:
         except (TypeError, ValueError) as error:
             raise ReplayAlignmentError(f"invalid anchor for {shot_id}: {error}") from error
     return PlayAlignment(play_id, tuple(sorted(anchors, key=lambda anchor: anchor.shot_id)))
+
+
+@dataclass(frozen=True, slots=True)
+class FieldTrack:
+    """A tracklet resampled into (play_time_s, field_x_yards, field_y_yards)."""
+
+    tracklet_id: str
+    shot_id: str
+    samples: tuple[tuple[float, float, float], ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(len(sample) != 3 for sample in self.samples):
+            raise ValueError("samples must be (play_time_s, field_x_yards, field_y_yards)")
+
+
+def _paired_samples(
+    left: FieldTrack,
+    right: FieldTrack,
+    tolerance_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pair samples that share a play time within tolerance, nearest match wins."""
+
+    if not left.samples or not right.samples:
+        return np.empty((0, 2)), np.empty((0, 2))
+    right_times = np.asarray([sample[0] for sample in right.samples], dtype=float)
+    right_points = np.asarray([(sample[1], sample[2]) for sample in right.samples], dtype=float)
+    left_pairs: list[tuple[float, float]] = []
+    right_pairs: list[tuple[float, float]] = []
+    for time_s, x, y in left.samples:
+        offsets = np.abs(right_times - time_s)
+        index = int(np.argmin(offsets))
+        if offsets[index] <= tolerance_s:
+            left_pairs.append((x, y))
+            right_pairs.append(tuple(right_points[index]))
+    return np.asarray(left_pairs, dtype=float), np.asarray(right_pairs, dtype=float)
+
+
+def _shape_agreement(left_points: np.ndarray, right_points: np.ndarray) -> float:
+    """Cosine agreement of net displacement, rescaled to [0, 1]."""
+
+    if len(left_points) < 2:
+        return 0.0
+    left_delta = left_points[-1] - left_points[0]
+    right_delta = right_points[-1] - right_points[0]
+    left_norm = float(np.linalg.norm(left_delta))
+    right_norm = float(np.linalg.norm(right_delta))
+    if left_norm < 1e-6 or right_norm < 1e-6:
+        # Two stationary players agree on shape but carry no directional evidence.
+        return 0.5
+    cosine = float(np.dot(left_delta, right_delta) / (left_norm * right_norm))
+    return max(0.0, min(1.0, (cosine + 1.0) / 2.0))
+
+
+def cross_shot_candidate_scores(
+    left: Sequence[FieldTrack],
+    right: Sequence[FieldTrack],
+    teams: Mapping[str, TeamEvidence],
+    *,
+    max_field_distance_yards: float = 6.0,
+    min_overlap_samples: int = 5,
+    sample_tolerance_s: float = 0.05,
+) -> dict[tuple[str, str], float]:
+    """Score cross-shot pairs from view-invariant evidence only.
+
+    A pair that fails a hard constraint is omitted entirely rather than scored
+    low, so ``match_tracklets`` reports ``insufficient_evidence`` instead of a
+    weak ``same``.
+    """
+
+    if max_field_distance_yards <= 0 or min_overlap_samples < 2:
+        raise ValueError("invalid cross-shot scoring constraints")
+    scores: dict[tuple[str, str], float] = {}
+    for left_track in sorted(left, key=lambda track: track.tracklet_id):
+        left_team = teams.get(left_track.tracklet_id)
+        if left_team is None or left_team.team == "unknown":
+            continue
+        for right_track in sorted(right, key=lambda track: track.tracklet_id):
+            right_team = teams.get(right_track.tracklet_id)
+            if right_team is None or right_team.team == "unknown":
+                continue
+            if left_team.team != right_team.team:
+                continue
+            left_points, right_points = _paired_samples(left_track, right_track, sample_tolerance_s)
+            if len(left_points) < min_overlap_samples:
+                continue
+            distances = np.linalg.norm(left_points - right_points, axis=1)
+            mean_distance = float(np.mean(distances))
+            if mean_distance > max_field_distance_yards:
+                continue
+            position = 1.0 - (mean_distance / max_field_distance_yards)
+            shape = _shape_agreement(left_points, right_points)
+            team_confidence = float(left_team.score * right_team.score)
+            score = 0.55 * position + 0.30 * shape + 0.15 * team_confidence
+            scores[(left_track.tracklet_id, right_track.tracklet_id)] = max(0.0, min(1.0, score))
+    return scores
