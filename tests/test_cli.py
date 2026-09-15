@@ -308,18 +308,19 @@ def test_run_reaches_a_resolved_cross_shot_outcome_from_view_invariant_evidence(
     assert exit_code == 0
 
     report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    # Asserted unconditionally: the fixture is deterministic (synthetic detector,
+    # fixed geometry), so a branch-tolerant assertion here would let a regression
+    # slide silently into the abstain path.
+    assert report["status"] == "resolved"
     assert report["candidate_pairs"] > 0
-    if report["status"] == "resolved":
-        assert report["accepted_links"] > 0
-        assert report["cross_shot_player_ids"] > 0
-        review = json.loads((output / "review.json").read_text(encoding="utf-8"))
-        assert review["status"] == "resolved_cross_view"
-        assert review["cross_view_identity_resolved"] is True
-        manifest = json.loads((output / "run-manifest.json").read_text(encoding="utf-8"))
-        assert manifest["status"] == "complete"
-    else:
-        # Honest fallback if this fixture's evidence does not clear the threshold
-        # and margin on this machine/build: prove the scorer was genuinely reached
-        # and abstained rather than silently producing zero candidates.
-        assert report["status"] == "abstained"
-        assert all(link["decision"] == "insufficient_evidence" for link in report["links"])
+    assert report["accepted_links"] > 0
+    assert report["cross_shot_player_ids"] > 0
+    assert {link["decision"] for link in report["links"]} == {"same"}
+    assert report["player_id_count"] < report["tracklet_count"]
+
+    review = json.loads((output / "review.json").read_text(encoding="utf-8"))
+    assert review["status"] == "resolved_cross_view"
+    assert review["cross_view_identity_resolved"] is True
+
+    manifest = json.loads((output / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
