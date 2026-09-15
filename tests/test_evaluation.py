@@ -171,3 +171,17 @@ def test_cross_shot_evaluation_is_not_evaluated_without_identity_map(tmp_path) -
     report = evaluate_cross_shot_identity({}, [], reference, None)
     assert report["status"] == "not_evaluated"
     assert "cross_shot_identity" in report["reason"]
+
+
+def test_cross_shot_coverage_denominator_keeps_reviewed_player_missed_by_detector(tmp_path) -> None:
+    path = _two_shot_reference(tmp_path)
+    reference = load_reviewed_mot_reference(path)
+    links = load_cross_shot_identity(path)
+    predictions = [
+        track("shot-0:t1", 0, (0.0, 0.0, 10.0, 10.0)),
+        track("shot-1:t1", 100, (0.0, 0.0, 10.0, 10.0)),
+    ]
+    report = evaluate_cross_shot_identity({"shot-0:t1": "P01", "shot-1:t1": "P01"}, predictions, reference, links)
+    assert report["shared_player_coverage"] == {"correct": 1, "eligible": 2, "value": 0.5}
+    assert report["gate"]["coverage_at_least_0_80"] is False
+    assert report["missing_shared_players"] == ["PLAYER-B"]

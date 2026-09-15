@@ -11,6 +11,7 @@ The first version prioritizes **stable anonymous player IDs, teams, and trajecto
 - [Sample footage assessment](docs/evidence/footage-assessment.md): verified metadata and inspected frames.
 - [Accuracy, calibration, and replay guide](docs/accuracy-calibration-replay.md): how to move from the baseline to football accuracy, yard-space calibration, and cross-view identity.
 - [Local annotation and data generation](docs/annotation-and-data-generation.md): CVAT/SAM2/FiftyOne workflow for reviewing initial tracks and fine-tuning RF-DETR without hosted Roboflow services.
+- [Annotation schema](docs/annotation-schema.md): source-hashed reviewed boxes, NFL field landmarks, timing, and identity labels.
 
 Status: **implemented and locally benchmarked**. The supplied [sample video](data/all-22-lions-rams-sample.mp4) is 23.76 seconds and contains a sideline view followed by an apparent end-zone replay. The implementation includes local model inference and proxy benchmarks; no GPT-6 Astra request or footage upload was performed.
 
@@ -90,6 +91,40 @@ shots, the resolver abstains by design and `identity-links.json` records
 `cross_shot_identity` map. See
 [docs/evidence/cross-shot-identity.md](docs/evidence/cross-shot-identity.md)
 for the measured state of this milestone on the current assets.
+
+For a tracker that fragments within one view, prepare a reviewed split overlay
+and pass it with `--reviewed-splits`. The raw tracker observations and cache are
+preserved; only the derived identity segments use the reviewed split IDs:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
+  --input data/all-22-lions-rams-sample.mp4 \
+  --output artifacts/cross-shot-refined \
+  --detector synthetic --tracker iou --manual-cut 712 \
+  --reviewed-splits /path/to/reviewed-splits.json
+```
+
+The split file must contain `{"reviewed": true, "splits": ...}` and every
+observed source tracklet frame must belong to exactly one reviewed segment.
+
+For moving cameras, `--calibration` also accepts a schema-v2 timeline whose
+keyframes carry `pts_start`, `pts_end`, fitting landmarks, and independent
+`withheld_image_points`/`withheld_field_points`. Only keyframes that pass the
+withheld geometry gate are eligible for cross-shot identity; gaps remain
+unresolved.
+
+To start reviewing the supplied long recording, extract exact scouting frames into an
+ignored pack (this does not upload or modify the source video):
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/build_identity_review_pack.py \
+  --input data/all-22-lions-rams.mp4 \
+  --output artifacts/full-game-calibration-review-pack \
+  --frame 1798 --frame 2098 --frame 2398
+```
+
+The pack is marked `reviewed: false` until a human records shot intervals, semantic field
+landmarks, timing correspondences, and identity labels.
 
 ## Memory guard
 

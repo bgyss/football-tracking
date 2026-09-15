@@ -101,35 +101,67 @@ def load_cross_shot_identity(path: str | Path) -> dict[str, dict[str, str]] | No
     for shot_id, mapping in raw.items():
         if not isinstance(mapping, dict) or not mapping:
             raise EvaluationError(f"cross_shot_identity[{shot_id!r}] must be a non-empty object")
+        # A global identity may intentionally have multiple non-overlapping
+        # reviewed fragments in one shot. Component-level overlap checks are
+        # reported during evaluation rather than rejecting the reference here.
         result[str(shot_id)] = {str(key): str(name) for key, name in mapping.items()}
     return result
+
+
+def reference_attribution(
+    rows: Sequence[TrackObservation],
+    frames: Mapping[int, ReferenceFrame],
+    iou_threshold: float = 0.5,
+) -> dict[str, dict[str, int]]:
+    """Return injective per-frame reference votes for every tracklet."""
+
+    votes: dict[str, dict[str, int]] = {}
+    rows_by_frame: dict[int, list[TrackObservation]] = {}
+    for row in rows:
+        rows_by_frame.setdefault(row.frame_index, []).append(row)
+    for frame_index, candidates in rows_by_frame.items():
+        frame = frames.get(frame_index)
+        if frame is None or not frame.labeled or frame.ignore:
+            continue
+        edges: list[tuple[float, str, str, int, int]] = []
+        for object_index, reference_object in enumerate(frame.objects):
+            for prediction_index, prediction in enumerate(candidates):
+                score = _iou(np.asarray(prediction.bbox_xyxy_px, dtype=float), np.asarray(reference_object.bbox_xyxy, dtype=float))
+                if score >= iou_threshold:
+                    edges.append((score, reference_object.identifier, prediction.tracklet_id, object_index, prediction_index))
+        assigned_objects: set[int] = set()
+        assigned_predictions: set[int] = set()
+        for _, _, _, object_index, prediction_index in sorted(edges, key=lambda edge: (-edge[0], edge[1], edge[2], edge[4])):
+            if object_index in assigned_objects or prediction_index in assigned_predictions:
+                continue
+            assigned_objects.add(object_index)
+            assigned_predictions.add(prediction_index)
+            tracklet_id = candidates[prediction_index].tracklet_id
+            reference_id = frame.objects[object_index].identifier
+            votes.setdefault(tracklet_id, {}).setdefault(reference_id, 0)
+            votes[tracklet_id][reference_id] += 1
+    return votes
 
 
 def dominant_reference_ids(
     rows: Sequence[TrackObservation],
     frames: Mapping[int, ReferenceFrame],
     iou_threshold: float = 0.5,
+    *,
+    min_purity: float = 0.75,
 ) -> dict[str, str]:
-    """Attribute each tracklet to the reference object it overlaps most often."""
+    """Attribute pure tracklets to their dominant reviewed reference object."""
 
-    votes: dict[str, dict[str, int]] = {}
-    for row in rows:
-        frame = frames.get(row.frame_index)
-        if frame is None or not frame.labeled or frame.ignore:
-            continue
-        best_id, best_iou = None, iou_threshold
-        for reference_object in frame.objects:
-            score = _iou(np.asarray(row.bbox_xyxy_px, dtype=float), np.asarray(reference_object.bbox_xyxy, dtype=float))
-            if score >= best_iou:
-                best_id, best_iou = reference_object.identifier, score
-        if best_id is not None:
-            votes.setdefault(row.tracklet_id, {}).setdefault(best_id, 0)
-            votes[row.tracklet_id][best_id] += 1
-    # Ties break on the lexicographically smallest id so the result is deterministic.
-    return {
-        tracklet_id: min(sorted(counts), key=lambda key: (-counts[key], key))
-        for tracklet_id, counts in votes.items()
-    }
+    if not 0.0 < min_purity <= 1.0:
+        raise ValueError("min_purity must be in (0, 1]")
+    votes = reference_attribution(rows, frames, iou_threshold)
+    result: dict[str, str] = {}
+    for tracklet_id, counts in votes.items():
+        total = sum(counts.values())
+        winner = min(sorted(counts), key=lambda key: (-counts[key], key))
+        if total and counts[winner] / total >= min_purity:
+            result[tracklet_id] = winner
+    return result
 
 
 def evaluate_cross_shot_identity(
@@ -148,13 +180,43 @@ def evaluate_cross_shot_identity(
     for row in predictions:
         by_shot.setdefault(row.tracklet_id.split(":", 1)[0], []).append(row)
     truth: dict[str, str] = {}
+    mixed_tracklets: list[str] = []
     for shot_id, frames in reference.items():
         shot_map = cross_shot_identity.get(shot_id, {})
+        votes = reference_attribution(by_shot.get(shot_id, []), frames, iou_threshold)
+        for tracklet_id, counts in votes.items():
+            total_votes = sum(counts.values())
+            winner = min(sorted(counts), key=lambda key: (-counts[key], key))
+            if total_votes and counts[winner] / total_votes < 0.75:
+                mixed_tracklets.append(tracklet_id)
         for tracklet_id, reference_id in dominant_reference_ids(by_shot.get(shot_id, []), frames, iou_threshold).items():
             global_id = shot_map.get(reference_id)
             if global_id is not None:
                 truth[tracklet_id] = global_id
     attributed = sorted(truth)
+    # Define eligibility from reviewed truth, independent of detector output.
+    # A shared player missed in one view must remain in the denominator.
+    global_shots: dict[str, set[str]] = {}
+    for shot_id, shot_map in cross_shot_identity.items():
+        for global_id in shot_map.values():
+            global_shots.setdefault(str(global_id), set()).add(str(shot_id))
+    eligible_globals = sorted(global_id for global_id, shots in global_shots.items() if len(shots) >= 2)
+    if not eligible_globals:
+        return {"status": "not_evaluated", "reason": "reviewed cross_shot_identity map has no player present in at least two shots"}
+    tracklets_by_global: dict[str, list[str]] = {global_id: [] for global_id in eligible_globals}
+    for tracklet_id, global_id in truth.items():
+        if global_id in tracklets_by_global:
+            tracklets_by_global[global_id].append(tracklet_id)
+    correct_globals = 0
+    missing_globals: list[str] = []
+    for global_id in eligible_globals:
+        tracklets = tracklets_by_global[global_id]
+        observed_shots = {tracklet.split(":", 1)[0] for tracklet in tracklets}
+        predicted_ids = {identity_map.get(tracklet) for tracklet in tracklets if identity_map.get(tracklet) is not None}
+        if len(observed_shots) >= 2 and len(predicted_ids) == 1:
+            correct_globals += 1
+        else:
+            missing_globals.append(global_id)
     resolvable = 0
     merged = 0
     true_merges = 0
@@ -180,20 +242,52 @@ def evaluate_cross_shot_identity(
             elif same_player and not same_id:
                 if len(missed_examples) < 20:
                     missed_examples.append({"left": left, "right": right, "player": truth[left]})
+    by_identity: dict[str, dict[str, set[str]]] = {}
+    for tracklet_id, player_id in identity_map.items():
+        shot_id = tracklet_id.split(":", 1)[0]
+        by_identity.setdefault(player_id, {}).setdefault(shot_id, set()).add(tracklet_id)
+    component_contamination = {
+        player_id: {shot_id: sorted(tracklets) for shot_id, tracklets in shots.items() if len(tracklets) > 1}
+        for player_id, shots in by_identity.items()
+        if any(len(tracklets) > 1 for tracklets in shots.values())
+    }
+    all_identity_tracklets = sorted(identity_map)
+    accepted_unattributed_pairs = sum(
+        (left not in truth or right not in truth)
+        for index, left in enumerate(all_identity_tracklets)
+        for right in all_identity_tracklets[index + 1 :]
+        if left.split(":", 1)[0] != right.split(":", 1)[0]
+        and identity_map.get(left) == identity_map.get(right)
+    )
     return {
         "status": "evaluated",
         "iou_threshold": iou_threshold,
         "attributed_tracklets": len(truth),
-        "resolvable_pairs": resolvable,
+        # Kept for compatibility with the earlier report; it now means the
+        # number of reviewed shared players, rather than prediction-derived
+        # tracklet pairs.
+        "resolvable_pairs": len(eligible_globals),
         "merged_pairs": merged,
         "true_merges": true_merges,
         "false_merges": false_merges,
-        "coverage": true_merges / resolvable if resolvable else 0.0,
+        "coverage": correct_globals / len(eligible_globals) if eligible_globals else 0.0,
         "precision": (true_merges / merged) if merged else None,
         "gate": {
             "false_merges_zero": false_merges == 0,
-            "coverage_at_least_0_80": (true_merges / resolvable if resolvable else 0.0) >= 0.80,
+            "components_clean": not component_contamination and accepted_unattributed_pairs == 0,
+            "coverage_at_least_0_80": (correct_globals / len(eligible_globals) if eligible_globals else 0.0) >= 0.80,
         },
+        "shared_player_coverage": {
+            "correct": correct_globals,
+            "eligible": len(eligible_globals),
+            "value": correct_globals / len(eligible_globals) if eligible_globals else 0.0,
+        },
+        "eligible_shared_players": eligible_globals,
+        "missing_shared_players": missing_globals,
+        "unattributed_tracklets": sorted(set(identity_map) - set(truth)),
+        "mixed_tracklets": sorted(set(mixed_tracklets)),
+        "component_contamination": component_contamination,
+        "accepted_unattributed_pairs": accepted_unattributed_pairs,
         "false_merge_examples": false_merge_examples,
         "missed_pair_examples": missed_examples,
     }
@@ -261,7 +355,9 @@ def _metrics_for_shot(rows: Sequence[TrackObservation], frames: Mapping[int, Ref
         "DetA": deta,
         "AssA": assa,
         "HOTA": (deta * assa) ** 0.5,
-        "IDF1": (2 * matches) / (2 * matches + false_positive + (total_gt - matches)) if total_gt else 0.0,
+        # This is detection F1, not identity F1. Standard IDF1 is supplied
+        # only by TrackEval and is never substituted with this diagnostic.
+        "detection_f1": (2 * matches) / (2 * matches + false_positive + (total_gt - matches)) if total_gt else 0.0,
         "id_switches": switches,
         "fragmentation": fragmentation,
     }
@@ -305,6 +401,10 @@ def _standard_trackeval_metrics(rows: Sequence[TrackObservation], frames: Mappin
     except ImportError:
         return {"status": "unavailable", "reason": "install the evaluation optional dependency"}
     data = _trackeval_data(rows, frames)
+    return _evaluate_trackeval_data(trackeval, data, iou_threshold)
+
+
+def _evaluate_trackeval_data(trackeval: Any, data: Mapping[str, Any], iou_threshold: float) -> dict[str, Any]:
     hota = trackeval.metrics.HOTA().eval_sequence(data)
     identity = trackeval.metrics.Identity({"THRESHOLD": iou_threshold, "PRINT_CONFIG": False}).eval_sequence(data)
     clear = trackeval.metrics.CLEAR({"THRESHOLD": iou_threshold, "PRINT_CONFIG": False}).eval_sequence(data)
@@ -317,6 +417,37 @@ def _standard_trackeval_metrics(rows: Sequence[TrackObservation], frames: Mappin
         "IDF1": float(identity["IDF1"]),
         "id_switches": int(clear["IDSW"]),
         "fragmentation": int(clear["Frag"]),
+    }
+
+
+def _combined_trackeval_data(
+    rows_by_shot: Mapping[str, Sequence[TrackObservation]],
+    reference: Mapping[str, Mapping[int, ReferenceFrame]],
+) -> dict[str, Any]:
+    """Concatenate shot sequences with disjoint IDs for one standard score."""
+
+    datasets = [_trackeval_data(rows_by_shot.get(shot_id, ()), frames) for shot_id, frames in sorted(reference.items())]
+    gt_offset = tracker_offset = 0
+    gt_ids: list[Any] = []
+    tracker_ids: list[Any] = []
+    similarities: list[Any] = []
+    for data in datasets:
+        for values in data["gt_ids"]:
+            gt_ids.append(values + gt_offset)
+        for values in data["tracker_ids"]:
+            tracker_ids.append(values + tracker_offset)
+        similarities.extend(data["similarity_scores"])
+        gt_offset += int(data["num_gt_ids"])
+        tracker_offset += int(data["num_tracker_ids"])
+    return {
+        "num_timesteps": len(gt_ids),
+        "num_gt_ids": gt_offset,
+        "num_tracker_ids": tracker_offset,
+        "num_gt_dets": sum(len(values) for values in gt_ids),
+        "num_tracker_dets": sum(len(values) for values in tracker_ids),
+        "gt_ids": gt_ids,
+        "tracker_ids": tracker_ids,
+        "similarity_scores": similarities,
     }
 
 
@@ -346,5 +477,31 @@ def evaluate_tracking(
     weighted_assa = sum(report["AssA"] * report["matched_detections"] for report in per_shot.values())
     aggregate["AssA"] = weighted_assa / matched if matched else 0.0
     aggregate["HOTA"] = (aggregate["DetA"] * aggregate["AssA"]) ** 0.5
-    aggregate["IDF1"] = (2 * matched) / (2 * matched + fp + (gt - matched)) if gt else 0.0
-    return {"status": "evaluated", "evaluator": {"name": "trackeval-compatible", "frame_numbering": "source_frame + 1", "iou_threshold": iou_threshold}, "per_shot": per_shot, "aggregate": aggregate}
+    trackeval_reports = {shot_id: report["trackeval"] for shot_id, report in per_shot.items()}
+    trackeval_available = bool(trackeval_reports) and all(report.get("status") == "evaluated" for report in trackeval_reports.values())
+    standard_aggregate: dict[str, Any] | None = None
+    if trackeval_available:
+        try:
+            import trackeval  # type: ignore[import-not-found]
+
+            standard_aggregate = _evaluate_trackeval_data(trackeval, _combined_trackeval_data(by_shot, reference), iou_threshold)
+        except Exception as error:
+            trackeval_available = False
+            standard_aggregate = {"status": "unavailable", "reason": f"TrackEval aggregation failed: {type(error).__name__}: {error}"}
+    standard_metrics = {
+        "status": "evaluated" if trackeval_available else "unavailable",
+        "evaluator": "trackeval==1.1.0" if trackeval_available else None,
+        "reason": None if trackeval_available else (standard_aggregate or {}).get("reason", "install the evaluation optional dependency"),
+        "aggregate": standard_aggregate,
+        "per_shot": trackeval_reports,
+        "aggregation": "TrackEval sequence concatenation with disjoint IDs" if trackeval_available else "unavailable",
+    }
+    return {
+        "schema_version": 2,
+        "status": "evaluated",
+        "evaluator": {"name": "trackeval-compatible", "frame_numbering": "source_frame + 1", "iou_threshold": iou_threshold},
+        "per_shot": per_shot,
+        "aggregate": aggregate,
+        "diagnostics": {"aggregate": aggregate, "per_shot": {shot_id: {key: value for key, value in report.items() if key != "trackeval"} for shot_id, report in per_shot.items()}},
+        "standard_metrics": standard_metrics,
+    }

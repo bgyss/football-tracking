@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import json
+
+import cv2
+import numpy as np
+import pytest
+
+from football_tracking.calibration_timeline import CalibrationTimelineError, estimate_field_motion, load_calibration_timeline, propagate_homography
+from football_tracking.calibration import FieldPoint, Homography, ImagePoint
+
+
+def config(scale: float = 10.0) -> dict:
+    return {"image_points": [[0, 0], [100, 0], [100, 100], [0, 100]], "field_points": [[0, 0], [scale, 0], [scale, scale], [0, scale]], "withheld_image_points": [[50, 50]], "withheld_field_points": [[scale / 2, scale / 2]]}
+
+
+def test_timeline_is_pts_scoped_and_rejects_gaps(tmp_path) -> None:
+    path = tmp_path / "timeline.json"
+    first = {**config(), "keyframe_id": "early", "pts_start": 0, "pts_end": 100}
+    second = {**config(), "keyframe_id": "late", "pts_start": 100, "pts_end": 200}
+    path.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [first, second]}}}), encoding="utf-8")
+    timeline = load_calibration_timeline(path)
+    assert timeline.at("shot-0", 50).calibration_id != timeline.at("shot-0", 150).calibration_id
+    assert timeline.at("shot-0", 250) is None
+    assert timeline.at("shot-1", 50) is None
+
+
+def test_timeline_derives_end_of_open_keyframe_from_next_keyframe(tmp_path) -> None:
+    path = tmp_path / "timeline.json"
+    first = {**config(), "keyframe_id": "early", "pts_start": 0}
+    second = {**config(), "keyframe_id": "late", "pts_start": 100, "pts_end": 200}
+    path.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [first, second]}}}), encoding="utf-8")
+    timeline = load_calibration_timeline(path)
+    assert timeline.at("shot-0", 99).calibration_id != timeline.at("shot-0", 101).calibration_id
+
+
+def test_timeline_export_round_trips_validity(tmp_path) -> None:
+    path = tmp_path / "timeline.json"
+    value = {"schema_version": 2, "shots": {"shot-0": {"keyframes": [{**config(), "pts_start": 0, "pts_end": 100}]}}}
+    path.write_text(json.dumps(value), encoding="utf-8")
+    timeline = load_calibration_timeline(path)
+    exported = tmp_path / "exported.json"
+    exported.write_text(json.dumps(timeline.to_dict()), encoding="utf-8")
+    reloaded = load_calibration_timeline(exported)
+    assert reloaded.at("shot-0", 50).identity_eligible is True
+
+
+def test_timeline_rejects_overlapping_intervals(tmp_path) -> None:
+    path = tmp_path / "timeline.json"
+    first = {**config(), "pts_start": 0, "pts_end": 100}
+    second = {**config(), "pts_start": 50, "pts_end": 200}
+    path.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [first, second]}}}), encoding="utf-8")
+    with pytest.raises(CalibrationTimelineError, match="overlapping"):
+        load_calibration_timeline(path)
+
+
+def test_propagation_composes_current_to_keyframe_direction() -> None:
+    h = Homography.fit([ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)], [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)])
+    # Current pixels are keyframe pixels translated by +10, so current->field
+    # must first translate by -10 before applying the keyframe H.
+    motion = np.asarray([[1, 0, 10], [0, 1, 0], [0, 0, 1]], dtype=float)
+    propagated = propagate_homography(h, motion)
+    assert propagated.project(ImagePoint(10, 0)) == FieldPoint(0.0, 0.0)
+
+
+def test_estimate_field_motion_returns_none_without_spatial_support() -> None:
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    assert estimate_field_motion(frame, frame) is None
+
+
+def test_estimate_field_motion_recovers_a_translation_from_static_texture() -> None:
+    previous = np.zeros((120, 160, 3), dtype=np.uint8)
+    for y in range(10, 110, 15):
+        for x in range(10, 150, 15):
+            cv2.circle(previous, (x, y), 3, (255, 255, 255), -1)
+    current = np.roll(previous, 5, axis=1)
+    motion = estimate_field_motion(previous, current)
+    assert motion is not None
+    assert motion[0, 2] == pytest.approx(5.0, abs=1.5)

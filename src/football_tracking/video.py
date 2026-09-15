@@ -86,6 +86,12 @@ def _frame_pts(path: Path) -> list[int]:
     return list(_frame_pts_cached(str(path)))
 
 
+def frame_pts(path: str | Path) -> tuple[int, ...]:
+    """Return the source video PTS sequence without decoding pixel frames."""
+
+    return tuple(_frame_pts(Path(path)))
+
+
 @dataclass(frozen=True, slots=True)
 class VideoInfo:
     path: str

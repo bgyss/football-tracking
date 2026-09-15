@@ -16,12 +16,22 @@ class TeamEvidence:
     score: float
     source: str
     crop_count: int
+    assignment_coverage: float = 0.0
+    ambiguity: float = 0.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.score <= 1.0:
             raise ValueError("team score must be between 0 and 1")
         if self.crop_count < 0:
             raise ValueError("crop_count must be non-negative")
+        if not 0.0 <= self.assignment_coverage <= 1.0:
+            raise ValueError("assignment coverage must be between 0 and 1")
+        if not 0.0 <= self.ambiguity <= 1.0:
+            raise ValueError("team ambiguity must be between 0 and 1")
+
+    @property
+    def eligible(self) -> bool:
+        return self.team != "unknown" and self.score > 0.0 and self.ambiguity < 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +54,19 @@ class IdentityLink:
     decision: str
     score: float
     evidence_keys: tuple[str, ...] = ()
+    alternative_score: float | None = None
+    ambiguity_margin: float | None = None
+    rejection_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.decision not in {"same", "different", "insufficient_evidence"}:
             raise ValueError("unsupported identity decision")
         if not 0.0 <= self.score <= 1.0:
             raise ValueError("identity score must be between 0 and 1")
+        if self.alternative_score is not None and not 0.0 <= self.alternative_score <= 1.0:
+            raise ValueError("alternative score must be between 0 and 1")
+        if self.ambiguity_margin is not None and self.ambiguity_margin < 0.0:
+            raise ValueError("ambiguity margin must be non-negative")
         if self.decision == "same" and self.right_key is None:
             raise ValueError("same links require a right key")
 
@@ -115,9 +132,19 @@ def resolve_teams(
             winners = np.argmin(distances, axis=1)
             counts = np.bincount(winners, minlength=len(names))
             winner = int(np.argmax(counts))
+            ordered_counts = sorted((int(count), index) for index, count in enumerate(counts))
+            runner_count = ordered_counts[-2][0] if len(ordered_counts) > 1 else 0
+            coverage = float(counts[winner] / len(winners)) if len(winners) else 0.0
+            ambiguity = float(runner_count / len(winners)) if len(winners) else 1.0
             assigned = distances[winners == winner, winner]
             score = float(np.mean(1.0 / (1.0 + assigned * 4.0))) if len(assigned) else 0.0
-            result[tracklet.tracklet_id] = TeamEvidence(names[winner], score, "rgb_prototype", len(tracklet.team_features))
+            ranked_distances = np.sort(distances, axis=1)
+            distance_ambiguity = float(np.mean((ranked_distances[:, 1] - ranked_distances[:, 0]) < 0.05)) if distances.shape[1] > 1 else 0.0
+            effective_ambiguity = max(ambiguity, distance_ambiguity)
+            if effective_ambiguity >= 0.5 or score < 0.5:
+                result[tracklet.tracklet_id] = TeamEvidence("unknown", score, "ambiguous_rgb_prototype", len(tracklet.team_features), coverage, effective_ambiguity)
+            else:
+                result[tracklet.tracklet_id] = TeamEvidence(names[winner], score, "rgb_prototype", len(tracklet.team_features), coverage, effective_ambiguity)
         return result
     all_features = [feature for tracklet in tracklets for feature in tracklet.team_features]
     if not all_features:
@@ -132,7 +159,7 @@ def resolve_teams(
         labels = np.argmin(distances, axis=1)
         winner = int(np.bincount(labels, minlength=2).argmax())
         assigned = distances[labels == winner, winner]
-        result[tracklet.tracklet_id] = TeamEvidence(f"team_{winner}", float(np.mean(1.0 / (1.0 + assigned * 4.0))), "rgb_cluster", len(tracklet.team_features))
+        result[tracklet.tracklet_id] = TeamEvidence(f"team_{winner}", float(np.mean(1.0 / (1.0 + assigned * 4.0))), "rgb_cluster", len(tracklet.team_features), float(np.mean(labels == winner)), 0.0)
     return result
 
 
@@ -159,37 +186,62 @@ def match_tracklets(
                 if not 0.0 <= score <= 1.0:
                     raise ValueError("candidate scores must be between 0 and 1")
                 matrix[i, j] = float(score)
+    # Keep unmatched as an explicit option.  Invalid and below-threshold edges
+    # are absent, while a dummy column has score zero.  This means an isolated
+    # high score can be selected without forcing an unrelated low score into a
+    # one-to-one assignment.
+    eligible = np.where(matrix >= threshold, matrix, -1.0)
+    augmented = np.concatenate([eligible, np.zeros((len(left), len(left)), dtype=float)], axis=1)
+
     try:
         from scipy.optimize import linear_sum_assignment
+    except ImportError as error:
+        raise RuntimeError("scipy is required for deterministic identity assignment") from error
 
-        rows, columns = linear_sum_assignment(-np.where(matrix >= 0, matrix, -1.0))
+    def solve(values: np.ndarray) -> tuple[dict[int, int], float]:
+        rows, columns = linear_sum_assignment(-values)
         assignment = {int(row): int(column) for row, column in zip(rows, columns)}
-    except ImportError:
-        assignment: dict[int, int] = {}
-        used: set[int] = set()
-        for row in range(len(left)):
-            choices = sorted(((matrix[row, column], column) for column in range(len(right)) if column not in used), reverse=True)
-            if choices and choices[0][0] >= 0:
-                assignment[row] = choices[0][1]
-                used.add(choices[0][1])
+        return assignment, float(sum(values[row, column] for row, column in assignment.items()))
+
+    assignment, baseline_objective = solve(augmented)
     links: list[IdentityLink] = []
-    selected_columns = set(assignment.values())
     for row, left_key in enumerate(left):
         column = assignment.get(row)
-        if column is None or matrix[row, column] < 0:
+        if column is None or column >= len(right) or eligible[row, column] < 0:
             links.append(IdentityLink(left_key, None, "insufficient_evidence", 0.0))
             continue
-        score = float(matrix[row, column])
-        alternatives = [
-            (float(matrix[row, other]), other)
-            for other in range(len(right))
-            if other != column and matrix[row, other] >= 0 and other not in selected_columns
-        ]
-        best_open_alternative = max((value for value, _ in alternatives), default=-1.0)
-        if score < threshold or (best_open_alternative >= 0 and score - best_open_alternative < margin):
-            links.append(IdentityLink(left_key, right[column], "insufficient_evidence", max(0.0, score)))
+        score = float(eligible[row, column])
+        # A genuine ambiguity is measured against the best complete assignment
+        # after forbidding this edge.  Do not remove already assigned columns
+        # from the alternative: a competing row may be the reason this edge is
+        # unsafe.  The dummy columns remain available in every alternative.
+        without_edge = augmented.copy()
+        without_edge[row, column] = 0.0
+        _, alternative_objective = solve(without_edge)
+        # Convert the global objective delta into the edge's score scale.  The
+        # objective can contain many rows, so compare the best competing edge
+        # contribution by subtracting all unchanged selected contributions.
+        global_margin = max(0.0, baseline_objective - alternative_objective)
+        alternative_score = max(0.0, min(1.0, score - global_margin))
+        if global_margin < margin:
+            links.append(IdentityLink(
+                left_key,
+                right[column],
+                "insufficient_evidence",
+                score,
+                alternative_score=alternative_score,
+                ambiguity_margin=global_margin,
+                rejection_reason="global_assignment_ambiguous",
+            ))
         else:
-            links.append(IdentityLink(left_key, right[column], "same", score))
+            links.append(IdentityLink(
+                left_key,
+                right[column],
+                "same",
+                score,
+                alternative_score=alternative_score,
+                ambiguity_margin=global_margin,
+            ))
     return links
 
 
@@ -207,6 +259,10 @@ def stable_anonymous_ids(tracklet_ids: Sequence[str], links: Sequence[IdentityLi
             raise ValueError("identity link references an unknown tracklet")
         first, second = find(left), find(right)
         if first != second:
+            first_shots = {member.split(":", 1)[0] for member in parent if find(member) == first}
+            second_shots = {member.split(":", 1)[0] for member in parent if find(member) == second}
+            if first_shots & second_shots:
+                raise ValueError("identity link would merge two tracklets from the same shot")
             parent[max(first, second)] = min(first, second)
 
     for link in links:

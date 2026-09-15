@@ -111,6 +111,12 @@ The acceptance report should include visible-player precision and recall, HOTA, 
 
 ## Repository changes that make this workflow easy
 
+The versioned annotation contract is documented in [annotation-schema.md](annotation-schema.md).
+Use `scripts/build_identity_review_pack.py` to extract exact, original-resolution frames
+and detector proposals. Its output is an unreviewed proposal pack; it cannot be passed to
+the evaluation loader until a human has filled the shot, split, landmark, contact, and
+identity fields and marked the manifest reviewed.
+
 The current code already has a clean seam for an annotation adapter. The next small additions should be:
 
 - `src/football_tracking/cvat.py`: serialize and parse reviewed CVAT tracks;

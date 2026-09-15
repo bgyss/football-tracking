@@ -53,10 +53,14 @@ export → evaluate → manifest.
   fallback), `RoboflowTracker` (botsort/bytetrack), and `McByteTracker` (opt-in masks
   via SAM + Cutie, explicit device, `effective_mode()` reports runtime mask fallback).
   A fresh tracker is constructed per shot; tracklet ids are shot-local (`shot-N:tID`).
-- `identity.py` — color-histogram team evidence, constrained tracklet matching, and
-  union-find `stable_anonymous_ids`.
+- `identity.py` — conservative team evidence, globally ambiguous tracklet matching, and
+  union-find `stable_anonymous_ids` with same-shot component guards.
+- `identity_resolution.py` — play-scoped all-view candidate resolution with explicit
+  partial and abstained outcomes.
+- `tracklet_refinement.py` — reviewed, immutable within-shot split overlays passed by
+  `--reviewed-splits`; raw tracker rows remain unchanged.
 - `replay.py` — reviewed play-time alignment (`--play-alignment`, refuses anything not
-  explicitly marked `reviewed: true`) and cross-shot candidate scoring from
+  explicitly marked `reviewed: true`), PTS-based maps, and cross-shot candidate scoring from
   view-invariant evidence only (team agreement, calibrated field position at aligned
   play time, trajectory shape). Cross-shot resolution runs when `--play-alignment`
   supplies reviewed snap anchors and requires genuinely shot-specific calibration for
@@ -64,8 +68,13 @@ export → evaluate → manifest.
   applying one camera pose's transform to another shot would make "field position" a
   restatement of image coordinates); otherwise it abstains. Every decision — resolved,
   abstained, or not attempted — is recorded in `identity-links.json`.
-- `calibration.py` — homography fit from landmark JSON; without `--calibration` the yard
-  columns stay empty and only image-space positions are exported.
+- `calibration.py` — homography fit from landmark JSON with pixel-space RANSAC and
+  independent yard residuals; without `--calibration` the yard columns stay empty and only
+  image-space positions are exported.
+- `calibration_timeline.py` — reviewed PTS-scoped fits, withheld-landmark eligibility, and
+  field-only motion propagation proposals.
+- `annotations.py` / `field.py` — source-hashed reviewed annotation manifests and the
+  canonical NFL field coordinate template.
 - `evaluation.py` — reviewed MOT-style reference import and HOTA/IDF1-style metrics.
   Without `--reviewed-reference`, `tracking-evaluation.json` says `not_evaluated`.
 - `memory.py` — `MemoryBudget`, a peak-RSS guard (default 2048 MiB) sampled at stage

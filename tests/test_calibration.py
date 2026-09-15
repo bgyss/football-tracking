@@ -68,3 +68,31 @@ def test_load_calibrations_supports_shot_specific_landmarks(tmp_path) -> None:
 
     assert set(calibrations) == {"shot-0", "shot-1"}
     assert calibrations["shot-1"].project(ImagePoint(100, 100)) == FieldPoint(10.0, 10.0)
+
+
+def test_homography_reports_pixel_and_field_residuals_in_their_own_units() -> None:
+    image = [ImagePoint(0, 0), ImagePoint(1000, 0), ImagePoint(1000, 500), ImagePoint(0, 500), ImagePoint(500, 250)]
+    field = [FieldPoint(0, 0), FieldPoint(120, 0), FieldPoint(120, 53.333), FieldPoint(0, 53.333), FieldPoint(60, 26.666)]
+    transform = Homography.fit(image, field, reprojection_threshold_px=3.0)
+    assert transform.fit_error_px == transform.median_error_px
+    assert transform.median_error_yards < 0.01
+    assert transform.reprojection_threshold_px == 3.0
+    assert transform.status == "unvalidated"
+
+
+def test_homography_uses_withheld_landmarks_for_validation_status() -> None:
+    image = [ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)]
+    field = [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)]
+    transform = Homography.fit(image, field, withheld_image_points=[ImagePoint(50, 50)], withheld_field_points=[FieldPoint(5, 5)])
+    assert transform.status == "valid"
+    assert transform.withheld_point_count == 1
+    assert transform.withheld_p95_error_yards == pytest.approx(0.0)
+
+
+def test_projection_rejects_nonfinite_or_off_field_contact() -> None:
+    transform = Homography.fit(
+        [ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)],
+        [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)],
+    )
+    assert transform.project(ImagePoint(float("nan"), 50)) is None
+    assert transform.project(ImagePoint(2000, 50)) is None

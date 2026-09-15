@@ -324,3 +324,46 @@ def test_run_reaches_a_resolved_cross_shot_outcome_from_view_invariant_evidence(
 
     manifest = json.loads((output / "run-manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "complete"
+
+
+def test_run_accepts_pts_scoped_calibration_timeline(tmp_path) -> None:
+    frames_per_shot = 7
+    input_path = tmp_path / "replay-timeline.mp4"
+    make_replay_video(input_path, frames_per_shot)
+    alignment = tmp_path / "alignment.json"
+    alignment.write_text(json.dumps({"reviewed": True, "play_id": "play-1", "anchors": [{"shot_id": "shot-0", "source_frame": 0}, {"shot_id": "shot-1", "source_frame": frames_per_shot}]}), encoding="utf-8")
+    base = {
+        "image_points": [[0, 0], [REPLAY_WIDTH, 0], [REPLAY_WIDTH, REPLAY_HEIGHT], [0, REPLAY_HEIGHT]],
+        "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
+        "withheld_image_points": [[REPLAY_WIDTH / 2, REPLAY_HEIGHT / 2]],
+        "withheld_field_points": [[60, 26.665]],
+        "pts_start": 0,
+        "pts_end": 100000,
+    }
+    calibration = tmp_path / "calibration-timeline.json"
+    calibration.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [base]}, "shot-1": {"keyframes": [base]}}}), encoding="utf-8")
+    prototypes = tmp_path / "prototypes.json"
+    prototypes.write_text(json.dumps({"blue": [0.0, 0.0, 1.0], "green": [0.0, 1.0, 0.0]}), encoding="utf-8")
+    output = tmp_path / "timeline-run"
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--tracker", "iou", "--manual-cut", str(frames_per_shot), "--play-alignment", str(alignment), "--calibration", str(calibration), "--team-prototypes", str(prototypes)]) == 0
+    report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    assert report["status"] == "resolved"
+    exported = json.loads((output / "calibration.json").read_text(encoding="utf-8"))
+    assert exported["schema_version"] == 2
+
+
+def test_analysis_identity_includes_calibration_provenance(tmp_path) -> None:
+    input_path = tmp_path / "hash.mp4"
+    make_video(input_path)
+    first_calibration = tmp_path / "first.json"
+    second_calibration = tmp_path / "second.json"
+    base = {"image_points": [[0, 0], [32, 0], [32, 24], [0, 24]], "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]]}
+    first_calibration.write_text(json.dumps(base), encoding="utf-8")
+    second_calibration.write_text(json.dumps({**base, "reprojection_threshold_px": 4.0}), encoding="utf-8")
+    first_output = tmp_path / "first-run"
+    second_output = tmp_path / "second-run"
+    assert main(["run", "--input", str(input_path), "--output", str(first_output), "--detector", "synthetic", "--tracker", "iou", "--calibration", str(first_calibration)]) == 0
+    assert main(["run", "--input", str(input_path), "--output", str(second_output), "--detector", "synthetic", "--tracker", "iou", "--calibration", str(second_calibration)]) == 0
+    first = json.loads((first_output / "run-manifest.json").read_text(encoding="utf-8"))
+    second = json.loads((second_output / "run-manifest.json").read_text(encoding="utf-8"))
+    assert first["config_hash"] != second["config_hash"]

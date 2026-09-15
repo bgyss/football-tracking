@@ -178,24 +178,26 @@ but its real-footage acceptance gate remains unproven.
 
 The [implementation plan](../superpowers/plans/2026-09-15-calibration-identity-correctness.md)
 and [primary-source research](cross-shot-identity-research-2026-09-15.md) describe the
-next work. No pipeline implementation was changed during this audit.
+work that followed this audit. The defects below were reproduced before the corresponding
+implementation changes; the current code and tests are the authority for their present
+status.
 
 ### Confirmed with executable probes
 
 | Probe | Actual result | Interpretation |
 | --- | --- | --- |
-| Two left/two right tracklets; every score is 0.9 | Both assignments return `same` | Selected columns are excluded from ambiguity alternatives; a completely tied assignment is accepted. |
-| Nine image/field landmarks, field scale 0.1 yards/pixel, center displaced 1.5 yards | `median_error_px` = 0.20208099677691288, identical to computed yard residual; all nine inliers, `is_valid=True` | The field-space residual is mislabeled as pixels. |
-| Two human-resolvable players shared by two views; only one player detected and correctly linked | `coverage=1.0`, `resolvable_pairs=1`, both gates true | Prediction-derived pair counting hides the missing shared player. Correct player coverage for this fixture is 1/2. |
-| Perfect detection boxes with two IDs alternating over three frames | Four switches, aggregate `IDF1=1.0` | The top-level IDF1 calculation measures detection matching rather than identity consistency. |
+| Two left/two right tracklets; every score is 0.9 (pre-fix) | Both assignments returned `same` | Selected columns were excluded from ambiguity alternatives; a completely tied assignment was accepted. |
+| Same tied-assignment probe after the fix | Both assignments return `insufficient_evidence` with zero ambiguity margin | Explicit dummy unmatched choices and global edge-forbidding now make ties abstain. |
+| Nine image/field landmarks, field scale 0.1 yards/pixel, center displaced 1.5 yards (pre-fix) | `median_error_px` = 0.20208099677691288, identical to computed yard residual; all nine inliers, `is_valid=True` | The pre-fix field-space residual was mislabeled as pixels. |
+| Same noisy landmark probe after the fix | Pixel median is approximately `3.2e-14`, field median approximately `3.6e-15`, max field error 1.5 yards, eight RANSAC inliers | Field-to-image RANSAC now applies the configured threshold in pixels and reports field residuals in yards. |
+| Two human-resolvable players shared by two views; only one player detected and correctly linked (pre-fix) | `coverage=1.0`, `resolvable_pairs=1`, both gates true | Prediction-derived pair counting hid the missing shared player; the current report uses a reviewed-player denominator and reports 1/2. |
+| Perfect detection boxes with two IDs alternating over three frames (pre-fix) | Four switches, aggregate `IDF1=1.0` | The pre-fix top-level IDF1 calculation measured detection matching rather than identity consistency; current standard IDF1 comes from TrackEval. |
 
-The unit defect follows directly from
-`cv2.findHomography(image, field, cv2.RANSAC, reprojection_threshold_px)` in
+The unit defect followed directly from the pre-fix
+`cv2.findHomography(image, field, cv2.RANSAC, reprojection_threshold_px)` call in
 `calibration.py`: OpenCV's inlier residual is measured in destination coordinates,
-which here are yards. The reported errors likewise subtract field coordinates.
-See [OpenCV's homography definition](https://docs.opencv.org/3.4.7/d9/d0c/group__calib3d.html).
-Fix the fitting direction or explicitly change the unit contract; do not preserve the
-current pixel label on yard residuals.
+which there were yards. The current code fits field-to-image for the pixel threshold,
+then inverts it for image-to-field projection. See [OpenCV's homography definition](https://docs.opencv.org/3.4.7/d9/d0c/group__calib3d.html).
 
 The two smallest probes can be reproduced from the repository root:
 
@@ -229,9 +231,10 @@ PY
   inspecting each homography's validity.
 - `replay.py:PlayAlignment`: one frame/fps offset per shot; no replay speed or edit model,
   and no check that an event anchor belongs to its named shot.
-- `cli.py`: resolves only the first two aligned shots having field samples; any accepted
-  link sets global resolved/complete status. Shots with no field samples are filtered
-  before unresolved reporting.
+- `cli.py` (pre-fix): resolved only the first two aligned shots having field samples;
+  any accepted link set global resolved/complete status. Shots with no field samples
+  were filtered before unresolved reporting. The current resolver evaluates every
+  aligned shot pair and reports `partially_resolved` when a view or pair is missing.
 - `identity.py`: crop availability normally forces a team assignment; union-find has no
   component-level play, simultaneous-visibility, or contradictory-evidence checks.
 - `evaluation.py`: independent best-overlap reference voting can attribute duplicate or
@@ -251,6 +254,16 @@ UV_CACHE_DIR=.uv-cache uv run --extra dev python -m pytest \
   tests/test_calibration.py tests/test_identity.py tests/test_replay.py \
   tests/test_evaluation.py tests/test_cli.py -q
 ```
+
+After the correctness implementation, the current fresh checks are:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run --extra dev python -m pytest -q
+UV_CACHE_DIR=.uv-cache uv run --extra dev --extra evaluation python -m pytest -q
+```
+
+Both suites pass in the implementation worktree. The first exercises the core path; the
+second also runs the optional TrackEval integration.
 
 The initial command without the development extra could not locate pytest in the fresh
 worktree environment; installing the declared development extra resolved it.
@@ -272,3 +285,13 @@ boundaries, matching play pairs, reviewed landmarks or timing anchors.
 
 The full game can support development and held-out play calibration/identity evaluation.
 It remains a single-game asset, so cross-game generalization requires additional games.
+
+## Review-pack artifact
+
+The ignored directory `artifacts/full-game-calibration-review-pack/` was generated from
+the full-game source with the review-pack script at 12 scouting frame indices. It contains
+original-resolution JPEGs plus `review-pack.json` with source hash, dimensions, frame
+indices, and PTS values marked `constant_rate_derivation`. The pack is a calibration and
+identity annotation starting point; it is not reviewed truth and cannot be passed to the
+evaluation loader until shot intervals, landmarks, timing events, and player labels are
+reviewed.

@@ -42,6 +42,12 @@ def write_observations_csv(path: str | Path, observations: Iterable[Observation]
         "position_source",
         "calibration_id",
         "identity_version",
+        "calibration_status",
+        "calibration_reason",
+        "position_uncertainty_yards",
+        "play_time_s",
+        "time_map_id",
+        "source_tracklet_id",
     ]
     ordered = sorted(observations, key=lambda row: (row.frame_index, row.shot_id, row.tracklet_id))
     with destination.open("w", newline="", encoding="utf-8") as handle:
@@ -73,7 +79,7 @@ def write_observations_parquet(path: str | Path, observations: Iterable[Observat
 def write_trajectories_csv(path: str | Path, observations: Iterable[Observation]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["player_id", "shot_id", "frame_index", "pts", "x_px", "y_px", "x_yards", "y_yards", "position_source", "calibration_id"]
+    fieldnames = ["player_id", "shot_id", "frame_index", "pts", "x_px", "y_px", "x_yards", "y_yards", "position_source", "calibration_id", "calibration_status", "position_uncertainty_yards", "play_time_s", "time_map_id", "source_tracklet_id"]
     rows = [row for row in observations if row.player_id]
     rows.sort(key=lambda row: (row.player_id or "", row.frame_index, row.shot_id))
     with destination.open("w", newline="", encoding="utf-8") as handle:
@@ -82,24 +88,35 @@ def write_trajectories_csv(path: str | Path, observations: Iterable[Observation]
         for row in rows:
             x1, _, x2, y2 = row.bbox_xyxy_px
             x_yards, y_yards = row.field_xy_yards or (None, None)
-            writer.writerow({"player_id": row.player_id, "shot_id": row.shot_id, "frame_index": row.frame_index, "pts": row.pts, "x_px": (x1 + x2) / 2.0, "y_px": y2, "x_yards": x_yards, "y_yards": y_yards, "position_source": row.position_source, "calibration_id": row.calibration_id})
+            writer.writerow({"player_id": row.player_id, "shot_id": row.shot_id, "frame_index": row.frame_index, "pts": row.pts, "x_px": (x1 + x2) / 2.0, "y_px": y2, "x_yards": x_yards, "y_yards": y_yards, "position_source": row.position_source, "calibration_id": row.calibration_id, "calibration_status": row.calibration_status, "position_uncertainty_yards": row.position_uncertainty_yards, "play_time_s": row.play_time_s, "time_map_id": row.time_map_id, "source_tracklet_id": row.source_tracklet_id})
 
 
 def write_calibration_json(path: str | Path, calibrations: Mapping[str, Any]) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not calibrations:
-        value: dict[str, Any] = {"status": "not_provided", "shots": {}}
+        value: dict[str, Any] = {"schema_version": 1, "status": "not_provided", "shots": {}}
     else:
-        value = {"status": "valid", "shots": {}}
+        statuses = {str(getattr(calibration, "status", "unvalidated")) for calibration in calibrations.values()}
+        overall_status = "valid" if statuses == {"valid"} else "invalid" if statuses == {"invalid"} else "partial" if "partial" in statuses or "invalid" in statuses or len(statuses) > 1 else "unvalidated"
+        value = {"schema_version": 1, "status": overall_status, "shots": {}}
         for shot_id, calibration in sorted(calibrations.items()):
             value["shots"][shot_id] = {
                 "matrix": calibration.matrix,
                 "median_error_px": calibration.median_error_px,
                 "max_error_px": calibration.max_error_px,
+                "fit_error_px": calibration.fit_error_px,
+                "median_error_yards": calibration.median_error_yards,
+                "max_error_yards": calibration.max_error_yards,
+                "withheld_median_error_yards": calibration.withheld_median_error_yards,
+                "withheld_p95_error_yards": calibration.withheld_p95_error_yards,
+                "withheld_point_count": calibration.withheld_point_count,
                 "inlier_count": calibration.inlier_count,
                 "point_count": calibration.point_count,
+                "reprojection_threshold_px": calibration.reprojection_threshold_px,
                 "calibration_id": calibration.calibration_id,
+                "status": calibration.status,
+                "reason": calibration.reason,
             }
     destination.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -161,6 +178,9 @@ def render_annotated_video(
     output_path: str | Path,
     observations: Iterable[Observation],
     shots: Sequence[ShotBoundary],
+    *,
+    start_frame: int = 0,
+    end_frame: int | None = None,
 ) -> None:
     """Render boxes, labels, and shot-local trails while retaining source audio when available."""
 
@@ -177,8 +197,10 @@ def render_annotated_video(
         by_frame.setdefault(observation.frame_index, []).append(observation)
     traces: dict[tuple[str, str], list[tuple[int, int]]] = {}
     previous_shot: str | None = None
+    if start_frame < 0 or (end_frame is not None and end_frame <= start_frame):
+        raise ValueError("invalid annotated-video frame window")
     try:
-        for frame_index, _, frame in iter_video_frames(source):
+        for frame_index, _, frame in iter_video_frames(source, start_frame=start_frame, end_frame=end_frame):
             shot_id = _current_shot(frame_index, shots)
             if previous_shot is not None and shot_id != previous_shot:
                 traces.clear()
@@ -198,7 +220,9 @@ def render_annotated_video(
             writer.write(frame)
     finally:
         writer.release()
-    if _has_audio(source):
+    # A bounded window has no corresponding audio offset in the current
+    # exporter; retain source audio only for a full-source render.
+    if _has_audio(source) and start_frame == 0 and (end_frame is None or end_frame >= info.frame_count):
         muxed = destination.with_name(destination.stem + ".muxed.mp4")
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video_only), "-i", str(source), "-map", "0:v:0", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac", "-shortest", str(muxed)]
         try:

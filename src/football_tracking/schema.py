@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any
 
 
@@ -37,6 +38,12 @@ class Observation:
     calibration_id: str | None
     identity_version: int
     play_id: str | None = None
+    calibration_status: str | None = None
+    calibration_reason: str | None = None
+    position_uncertainty_yards: float | None = None
+    play_time_s: float | None = None
+    time_map_id: str | None = None
+    source_tracklet_id: str | None = None
 
     def __post_init__(self) -> None:
         x1, y1, x2, y2 = self.bbox_xyxy_px
@@ -56,8 +63,16 @@ class Observation:
             raise ValueError("jersey_number must be between 0 and 99")
         if self.field_xy_yards is not None and len(self.field_xy_yards) != 2:
             raise ValueError("field_xy_yards must contain x and y")
+        if self.field_xy_yards is not None and any(not math.isfinite(float(value)) for value in self.field_xy_yards):
+            raise ValueError("field_xy_yards must be finite")
         if self.identity_version < 0:
             raise ValueError("identity_version must be non-negative")
+        if self.position_uncertainty_yards is not None and self.position_uncertainty_yards < 0:
+            raise ValueError("position_uncertainty_yards must be non-negative")
+        if self.position_uncertainty_yards is not None and not math.isfinite(float(self.position_uncertainty_yards)):
+            raise ValueError("position_uncertainty_yards must be finite")
+        if self.play_time_s is not None and not math.isfinite(float(self.play_time_s)):
+            raise ValueError("play_time_s must be finite")
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(asdict(self))

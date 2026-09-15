@@ -26,18 +26,27 @@ class PlayAnchor:
     shot_id: str
     source_frame: int
     event: str
+    source_pts: int | None = None
+    play_time_s_value: float | None = None
 
     def __post_init__(self) -> None:
         if self.source_frame < 0:
             raise ValueError("anchor source_frame must be non-negative")
         if not self.event:
             raise ValueError("anchor event must be named")
+        if self.source_pts is not None and self.source_pts < 0:
+            raise ValueError("anchor source_pts must be non-negative")
+        if self.play_time_s_value is not None and not np.isfinite(self.play_time_s_value):
+            raise ValueError("anchor play_time_s must be finite")
+        if self.play_time_s_value is not None and self.source_pts is None:
+            raise ValueError("anchor play_time_s requires source_pts")
 
 
 @dataclass(frozen=True, slots=True)
 class PlayAlignment:
     play_id: str
     anchors: tuple[PlayAnchor, ...]
+    time_map: "PlayTimeMap | None" = None
 
     def shots(self) -> tuple[str, ...]:
         return tuple(sorted(anchor.shot_id for anchor in self.anchors))
@@ -49,6 +58,94 @@ class PlayAlignment:
             if anchor.shot_id == shot_id:
                 return (frame_index - anchor.source_frame) / fps
         return None
+
+    def play_time_at_pts(self, shot_id: str, pts: int, time_base: tuple[int, int], fps: float | None = None, frame_index: int | None = None) -> float | None:
+        """Map source PTS to play time, with a legacy frame/fps fallback."""
+
+        if self.time_map is not None:
+            mapped = self.time_map.at(shot_id, pts)
+            if mapped is not None:
+                return mapped
+        if fps is not None and frame_index is not None:
+            return self.play_time_s(shot_id, frame_index, fps)
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class PlayTimeCorrespondence:
+    shot_id: str
+    pts: int
+    play_time_s: float
+    event: str
+
+    def __post_init__(self) -> None:
+        if self.pts < 0 or not np.isfinite(self.play_time_s) or not self.event:
+            raise ValueError("invalid play-time correspondence")
+
+
+class PlayTimeMap:
+    """Piecewise-linear, source-PTS to common play-time mapping.
+
+    Mapping never extrapolates outside reviewed correspondences. This prevents
+    a freeze, edit or slow-motion section from fabricating overlap.
+    """
+
+    def __init__(self, correspondences: Sequence[PlayTimeCorrespondence], *, max_residual_ms: float = 50.0) -> None:
+        if not np.isfinite(max_residual_ms) or max_residual_ms <= 0:
+            raise ValueError("max_residual_ms must be positive")
+        by_shot: dict[str, tuple[PlayTimeCorrespondence, ...]] = {}
+        for shot_id in sorted({item.shot_id for item in correspondences}):
+            values = tuple(sorted((item for item in correspondences if item.shot_id == shot_id), key=lambda item: item.pts))
+            if len(values) < 2:
+                raise ReplayAlignmentError(f"play-time map needs two correspondences for {shot_id}")
+            events = [item.event for item in values]
+            if len(set(events)) != len(events):
+                raise ReplayAlignmentError(f"play-time map has duplicate event labels for {shot_id}")
+            if any(left.pts == right.pts or right.play_time_s <= left.play_time_s for left, right in zip(values, values[1:])):
+                raise ReplayAlignmentError(f"play-time map must be strictly increasing for {shot_id}")
+            by_shot[shot_id] = values
+        if not by_shot:
+            raise ReplayAlignmentError("play-time map has no correspondences")
+        self._correspondences = by_shot
+        self.max_residual_ms = float(max_residual_ms)
+
+    def at(self, shot_id: str, pts: int) -> float | None:
+        if pts < 0:
+            raise ValueError("pts must be non-negative")
+        values = self._correspondences.get(str(shot_id), ())
+        if not values or pts < values[0].pts or pts > values[-1].pts:
+            return None
+        for left, right in zip(values, values[1:]):
+            if left.pts <= pts <= right.pts:
+                ratio = (pts - left.pts) / float(right.pts - left.pts)
+                return float(left.play_time_s + ratio * (right.play_time_s - left.play_time_s))
+        return None
+
+    def shots(self) -> tuple[str, ...]:
+        return tuple(sorted(self._correspondences))
+
+    def validate(self, checks: Sequence[PlayTimeCorrespondence]) -> dict[str, object]:
+        """Evaluate held-out reviewed events without refitting the map."""
+
+        residuals: list[float] = []
+        missing: list[dict[str, object]] = []
+        for check in checks:
+            predicted = self.at(check.shot_id, check.pts)
+            if predicted is None:
+                missing.append({"shot_id": check.shot_id, "pts": check.pts, "event": check.event})
+            else:
+                residuals.append(abs(predicted - check.play_time_s) * 1000.0)
+        maximum = max(residuals, default=float("inf") if missing else 0.0)
+        return {"status": "valid" if not missing and maximum <= self.max_residual_ms else "invalid", "max_residual_ms": maximum, "residuals_ms": residuals, "missing": missing, "gate": maximum <= self.max_residual_ms and not missing}
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "max_residual_ms": self.max_residual_ms,
+            "shots": {
+                shot_id: [{"pts": item.pts, "play_time_s": item.play_time_s, "event": item.event} for item in values]
+                for shot_id, values in sorted(self._correspondences.items())
+            },
+        }
 
 
 def load_play_alignment(path: str | Path) -> PlayAlignment:
@@ -76,10 +173,29 @@ def load_play_alignment(path: str | Path) -> PlayAlignment:
             raise ReplayAlignmentError(f"duplicate anchor for {shot_id}")
         seen.add(shot_id)
         try:
-            anchors.append(PlayAnchor(shot_id, int(raw["source_frame"]), str(raw.get("event", "snap"))))
+            anchors.append(PlayAnchor(shot_id, int(raw["source_frame"]), str(raw.get("event", "snap")), None if raw.get("source_pts") is None else int(raw["source_pts"]), None if raw.get("play_time_s") is None else float(raw["play_time_s"])))
         except (TypeError, ValueError) as error:
             raise ReplayAlignmentError(f"invalid anchor for {shot_id}: {error}") from error
-    return PlayAlignment(play_id, tuple(sorted(anchors, key=lambda anchor: anchor.shot_id)))
+    ordered = tuple(sorted(anchors, key=lambda anchor: anchor.shot_id))
+    correspondences = [PlayTimeCorrespondence(anchor.shot_id, anchor.source_pts, anchor.play_time_s_value, anchor.event) for anchor in ordered if anchor.source_pts is not None and anchor.play_time_s_value is not None]
+    raw_correspondences = value.get("correspondences", [])
+    if raw_correspondences:
+        if not isinstance(raw_correspondences, list):
+            raise ReplayAlignmentError("correspondences must be a list")
+        for raw in raw_correspondences:
+            if not isinstance(raw, dict):
+                raise ReplayAlignmentError(f"invalid correspondence: {raw!r}")
+            try:
+                correspondences.append(PlayTimeCorrespondence(str(raw["shot_id"]), int(raw["source_pts"]), float(raw["play_time_s"]), str(raw["event"])))
+            except (KeyError, TypeError, ValueError) as error:
+                raise ReplayAlignmentError(f"invalid correspondence: {raw!r}") from error
+    time_map = None
+    if correspondences and all(sum(item.shot_id == shot_id for item in correspondences) >= 2 for shot_id in {item.shot_id for item in correspondences}):
+        try:
+            time_map = PlayTimeMap(correspondences, max_residual_ms=float(value.get("max_residual_ms", 50.0)))
+        except ReplayAlignmentError:
+            raise
+    return PlayAlignment(play_id, ordered, time_map)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +268,7 @@ def cross_shot_candidate_scores(
     max_field_distance_yards: float = 6.0,
     min_overlap_samples: int = 5,
     sample_tolerance_s: float = 0.05,
+    min_overlap_duration_s: float = 0.4,
 ) -> dict[tuple[str, str], float]:
     """Score cross-shot pairs from view-invariant evidence only.
 
@@ -160,27 +277,42 @@ def cross_shot_candidate_scores(
     weak ``same``.
     """
 
-    if max_field_distance_yards <= 0 or min_overlap_samples < 2:
+    if max_field_distance_yards <= 0 or min_overlap_samples < 2 or sample_tolerance_s <= 0 or min_overlap_duration_s < 0:
         raise ValueError("invalid cross-shot scoring constraints")
     scores: dict[tuple[str, str], float] = {}
     for left_track in sorted(left, key=lambda track: track.tracklet_id):
         left_team = teams.get(left_track.tracklet_id)
-        if left_team is None or left_team.team == "unknown":
+        if left_team is None or not left_team.eligible:
             continue
         for right_track in sorted(right, key=lambda track: track.tracklet_id):
             right_team = teams.get(right_track.tracklet_id)
-            if right_team is None or right_team.team == "unknown":
+            if right_team is None or not right_team.eligible:
                 continue
             if left_team.team != right_team.team:
                 continue
             left_points, right_points = _paired_samples(left_track, right_track, sample_tolerance_s)
             if len(left_points) < min_overlap_samples:
                 continue
-            distances = np.linalg.norm(left_points - right_points, axis=1)
-            mean_distance = float(np.mean(distances))
-            if mean_distance > max_field_distance_yards:
+            paired_times = []
+            right_times = np.asarray([sample[0] for sample in right_track.samples], dtype=float)
+            used_right: set[int] = set()
+            for time_s, _, _ in left_track.samples:
+                offsets = np.abs(right_times - time_s)
+                if used_right:
+                    offsets = offsets.copy()
+                    offsets[list(used_right)] = np.inf
+                index = int(np.argmin(offsets))
+                if offsets[index] <= sample_tolerance_s:
+                    used_right.add(index)
+                    paired_times.append(float(time_s))
+            if paired_times and max(paired_times) - min(paired_times) < min_overlap_duration_s:
                 continue
-            position = 1.0 - (mean_distance / max_field_distance_yards)
+            distances = np.linalg.norm(left_points - right_points, axis=1)
+            median_distance = float(np.median(distances))
+            p90_distance = float(np.percentile(distances, 90))
+            if p90_distance > max_field_distance_yards:
+                continue
+            position = 1.0 - (median_distance / max_field_distance_yards)
             shape = _shape_agreement(left_points, right_points)
             team_confidence = float(left_team.score * right_team.score)
             score = 0.55 * position + 0.30 * shape + 0.15 * team_confidence

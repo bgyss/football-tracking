@@ -7,6 +7,8 @@ import pytest
 from football_tracking.replay import (
     PlayAlignment,
     PlayAnchor,
+    PlayTimeCorrespondence,
+    PlayTimeMap,
     ReplayAlignmentError,
     load_play_alignment,
 )
@@ -100,6 +102,47 @@ def test_load_play_alignment_rejects_malformed_anchors(tmp_path) -> None:
     }), encoding="utf-8")
     with pytest.raises(ReplayAlignmentError):
         load_play_alignment(empty_event)
+
+
+def test_play_time_map_uses_pts_without_extrapolation() -> None:
+    mapping = PlayTimeMap([
+        PlayTimeCorrespondence("shot-0", 100, 0.0, "snap"),
+        PlayTimeCorrespondence("shot-0", 200, 1.0, "contact"),
+        PlayTimeCorrespondence("shot-1", 1000, 0.0, "snap"),
+        PlayTimeCorrespondence("shot-1", 1100, 1.0, "contact"),
+    ])
+    assert mapping.at("shot-0", 150) == pytest.approx(0.5)
+    assert mapping.at("shot-0", 99) is None
+    assert mapping.at("shot-2", 150) is None
+    check = PlayTimeCorrespondence("shot-0", 175, 0.75, "release")
+    assert mapping.validate([check])["gate"] is True
+
+
+def test_play_time_map_rejects_nonmonotonic_correspondences() -> None:
+    with pytest.raises(ReplayAlignmentError):
+        PlayTimeMap([
+            PlayTimeCorrespondence("shot-0", 100, 0.0, "snap"),
+            PlayTimeCorrespondence("shot-0", 200, 0.0, "contact"),
+        ])
+
+
+def test_alignment_loader_accepts_reviewed_pts_correspondences(tmp_path) -> None:
+    path = tmp_path / "pts-alignment.json"
+    path.write_text(json.dumps({
+        "reviewed": True,
+        "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 0, "source_pts": 100, "play_time_s": 0.0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 10, "source_pts": 1000, "play_time_s": 0.0, "event": "snap"},
+        ],
+        "correspondences": [
+            {"shot_id": "shot-0", "source_pts": 200, "play_time_s": 1.0, "event": "contact"},
+            {"shot_id": "shot-1", "source_pts": 1100, "play_time_s": 1.0, "event": "contact"},
+        ],
+    }), encoding="utf-8")
+    alignment = load_play_alignment(path)
+    assert alignment.time_map is not None
+    assert alignment.play_time_at_pts("shot-0", 150, (1, 100), fps=100, frame_index=5) == pytest.approx(0.5)
 
 
 from football_tracking.identity import TeamEvidence

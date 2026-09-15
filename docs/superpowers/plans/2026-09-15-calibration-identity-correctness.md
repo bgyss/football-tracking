@@ -234,6 +234,19 @@ assert all(link.decision == "insufficient_evidence" for link in links)
 
 ## Execution readiness and stop conditions
 
-Tasks 1–3 can start immediately without calibration annotations. Task 4 can generate review material immediately; tasks 5–8 can develop against fixtures while annotations are reviewed. Real acceptance remains blocked until independent geometry, timing and identity labels exist. The user has supplied footage useful for producing them; this plan does not pretend raw video is already reviewed calibration data.
+## Implementation status (2026-09-15)
+
+The current worktree implements the first safety and data-contract slice:
+
+- calibration now fits with a pixel-space RANSAC threshold, reports pixel and yard residuals separately, validates withheld points, rejects invalid projections, and supports a PTS-scoped timeline plus tested motion composition;
+- identity assignment has explicit unmatched choices, global ambiguity margins, component conflict rejection, conservative team evidence, reviewed split overlays, and an all-aligned-view play resolver;
+- evaluation keeps the reviewed shared-player denominator independent of detections, reports mixed/unattributed/component cases, and exposes standard TrackEval metrics separately from diagnostics;
+- versioned annotation/field contracts and an ignored full-game review-pack generator are available.
+
+Real footage acceptance is still a data-gated milestone: the generated full-game pack is
+unreviewed, and no accepted identity or calibration score should be reported until the
+reviewed landmarks, timing correspondences, local tracks, and cross-shot map exist.
+
+Tasks 1–8 can continue against fixtures and reviewed overlays while annotations are prepared. Real acceptance remains blocked until independent geometry, timing and identity labels exist. The user has supplied footage useful for producing them; this plan does not pretend raw video is already reviewed calibration data.
 
 Do not stop all work for missing annotations: continue schema, importer, regression and export work. Stop promotion when a gate fails, an identity component is contradictory, a view lacks valid calibration, alignment is unsupported, or the evaluation denominator is unreviewed. Record the exact next label or defect needed to proceed.
