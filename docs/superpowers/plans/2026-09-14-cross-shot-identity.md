@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Continuation:** The plumbing described here is implemented. Follow the [calibration and identity correctness plan](2026-09-15-calibration-identity-correctness.md) for the next milestone and current defect findings. Historical observations below describe the pre-implementation state.
+
 **Goal:** Make cross-shot player identity measurable and then resolvable, so that a tracklet in the end-zone replay can be joined to the same player's tracklet in the sideline shot under a predeclared zero-false-merge gate.
 
 **Architecture:** Add a measurement layer first (`evaluation.py` gains a cross-shot identity scorer and the reviewed-reference schema gains an optional global-identity map), then a resolution layer (`replay.py` aligns shots on a reviewed snap anchor and produces candidate scores) that feeds the *already implemented and already tested* `match_tracklets` → `stable_anonymous_ids` path in `identity.py`. The CLI wires them together behind an explicit `--play-alignment` flag; with no flag, behavior is byte-identical to today except for a new `identity-links.json` evidence file.

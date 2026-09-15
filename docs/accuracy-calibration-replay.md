@@ -109,7 +109,23 @@ GPT-6 Astra can assist only with selected ambiguous crop comparisons. Supply num
 
 Measure cross-view precision and coverage independently from within-shot IDF1. The proposed cross-view gate is zero false merges with at least 0.80 coverage of human-resolvable shared players. A correct replay merge represents one play with two observations; it must not double-count distance, events, or player participation.
 
-## Recommended order
+## Current implementation priority (2026-09-15)
+
+The [correctness implementation plan](superpowers/plans/2026-09-15-calibration-identity-correctness.md)
+is the next execution plan. The [audit](evidence/cross-shot-identity.md#2026-09-15-correctness-audit)
+found a calibration-unit mismatch, assignment ambiguity defects, and evaluation/reporting
+issues that must be repaired before promoting real cross-shot identity results.
+
+Use the full-game All-22 file to produce reviewed, time-keyed landmarks and independent
+play/identity labels. Begin with manual geometry and timing; measure detector and local
+track quality on the same labels before deciding whether fine-tuning is the bottleneck.
+The [research update](evidence/cross-shot-identity-research-2026-09-15.md) explains the
+limits of transferring published NFL and soccer methods.
+
+## Broader development sequence
+
+The sequence below remains the broader capability roadmap; the correctness fixes and
+reviewed-data work above precede promoting its results.
 
 1. Build the football training set and fine-tune RF-DETR.
 2. Annotate development and held-out identity sequences, then tune ByteTrack and BoT-SORT on the same detection cache.
