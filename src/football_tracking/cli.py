@@ -402,6 +402,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 "play_id": alignment.play_id,
                 "left_shot": left_shot,
                 "right_shot": right_shot,
+                "unresolved_shots": aligned_shots[2:],
+                "note": "only the first two aligned shots are resolved in this milestone",
                 "candidate_pairs": len(candidate_scores),
                 "accepted_links": len(accepted),
             }

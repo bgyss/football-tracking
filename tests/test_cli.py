@@ -163,3 +163,38 @@ def test_run_rejects_unreviewed_play_alignment(tmp_path) -> None:
         "--play-alignment", str(alignment),
     ])
     assert exit_code == 2
+
+
+def test_run_records_unresolved_shots_in_two_shot_cross_identity(tmp_path) -> None:
+    input_path = tmp_path / "tiny.mp4"
+    make_video(input_path)
+
+    alignment = tmp_path / "alignment.json"
+    alignment.write_text(json.dumps({
+        "reviewed": True, "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": 2, "event": "snap"},
+        ],
+    }), encoding="utf-8")
+
+    # Minimal calibration that maps frame corners to field coordinates
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({
+        "image_points": [[0, 0], [32, 0], [32, 24], [0, 24]],
+        "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
+    }), encoding="utf-8")
+
+    output = tmp_path / "run"
+    exit_code = main([
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
+        "--play-alignment", str(alignment),
+        "--calibration", str(calibration),
+    ])
+    assert exit_code == 0
+
+    report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    # In a two-shot scenario, unresolved_shots should be empty
+    assert report.get("unresolved_shots") == []
+    assert report.get("note") == "only the first two aligned shots are resolved in this milestone"
