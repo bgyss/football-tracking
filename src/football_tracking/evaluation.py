@@ -79,6 +79,126 @@ def load_reviewed_mot_reference(path: str | Path) -> dict[str, dict[int, Referen
     return result
 
 
+def load_cross_shot_identity(path: str | Path) -> dict[str, dict[str, str]] | None:
+    """Load the optional reviewed map from sequence-local object ids to global player ids.
+
+    Returns None when the reviewed reference simply does not carry the map, so a
+    caller can report ``not_evaluated`` rather than inventing a cross-shot score.
+    """
+
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise EvaluationError(f"unable to read reference: {error}") from error
+    if not isinstance(value, dict) or value.get("reviewed") is not True:
+        raise EvaluationError("reference must be explicitly marked reviewed: true")
+    raw = value.get("cross_shot_identity")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not raw:
+        raise EvaluationError("cross_shot_identity must be a non-empty object when present")
+    result: dict[str, dict[str, str]] = {}
+    for shot_id, mapping in raw.items():
+        if not isinstance(mapping, dict) or not mapping:
+            raise EvaluationError(f"cross_shot_identity[{shot_id!r}] must be a non-empty object")
+        result[str(shot_id)] = {str(key): str(name) for key, name in mapping.items()}
+    return result
+
+
+def dominant_reference_ids(
+    rows: Sequence[TrackObservation],
+    frames: Mapping[int, ReferenceFrame],
+    iou_threshold: float = 0.5,
+) -> dict[str, str]:
+    """Attribute each tracklet to the reference object it overlaps most often."""
+
+    votes: dict[str, dict[str, int]] = {}
+    for row in rows:
+        frame = frames.get(row.frame_index)
+        if frame is None or not frame.labeled or frame.ignore:
+            continue
+        best_id, best_iou = None, iou_threshold
+        for reference_object in frame.objects:
+            score = _iou(np.asarray(row.bbox_xyxy_px, dtype=float), np.asarray(reference_object.bbox_xyxy, dtype=float))
+            if score >= best_iou:
+                best_id, best_iou = reference_object.identifier, score
+        if best_id is not None:
+            votes.setdefault(row.tracklet_id, {}).setdefault(best_id, 0)
+            votes[row.tracklet_id][best_id] += 1
+    # Ties break on the lexicographically smallest id so the result is deterministic.
+    return {
+        tracklet_id: min(sorted(counts), key=lambda key: (-counts[key], key))
+        for tracklet_id, counts in votes.items()
+    }
+
+
+def evaluate_cross_shot_identity(
+    identity_map: Mapping[str, str],
+    predictions: Sequence[TrackObservation],
+    reference: Mapping[str, Mapping[int, ReferenceFrame]],
+    cross_shot_identity: Mapping[str, Mapping[str, str]] | None,
+    *,
+    iou_threshold: float = 0.5,
+) -> dict[str, Any]:
+    """Score cross-shot merges as precision and coverage, never as a single number."""
+
+    if not cross_shot_identity:
+        return {"status": "not_evaluated", "reason": "reviewed reference carries no cross_shot_identity map"}
+    by_shot: dict[str, list[TrackObservation]] = {}
+    for row in predictions:
+        by_shot.setdefault(row.tracklet_id.split(":", 1)[0], []).append(row)
+    truth: dict[str, str] = {}
+    for shot_id, frames in reference.items():
+        shot_map = cross_shot_identity.get(shot_id, {})
+        for tracklet_id, reference_id in dominant_reference_ids(by_shot.get(shot_id, []), frames, iou_threshold).items():
+            global_id = shot_map.get(reference_id)
+            if global_id is not None:
+                truth[tracklet_id] = global_id
+    attributed = sorted(truth)
+    resolvable = 0
+    merged = 0
+    true_merges = 0
+    false_merges = 0
+    false_merge_examples: list[dict[str, str]] = []
+    missed_examples: list[dict[str, str]] = []
+    for index, left in enumerate(attributed):
+        for right in attributed[index + 1 :]:
+            if left.split(":", 1)[0] == right.split(":", 1)[0]:
+                continue
+            same_player = truth[left] == truth[right]
+            same_id = identity_map.get(left) is not None and identity_map.get(left) == identity_map.get(right)
+            if same_player:
+                resolvable += 1
+            if same_id:
+                merged += 1
+            if same_id and same_player:
+                true_merges += 1
+            elif same_id and not same_player:
+                false_merges += 1
+                if len(false_merge_examples) < 20:
+                    false_merge_examples.append({"left": left, "right": right, "left_player": truth[left], "right_player": truth[right]})
+            elif same_player and not same_id:
+                if len(missed_examples) < 20:
+                    missed_examples.append({"left": left, "right": right, "player": truth[left]})
+    return {
+        "status": "evaluated",
+        "iou_threshold": iou_threshold,
+        "attributed_tracklets": len(truth),
+        "resolvable_pairs": resolvable,
+        "merged_pairs": merged,
+        "true_merges": true_merges,
+        "false_merges": false_merges,
+        "coverage": true_merges / resolvable if resolvable else 0.0,
+        "precision": (true_merges / merged) if merged else None,
+        "gate": {
+            "false_merges_zero": false_merges == 0,
+            "coverage_at_least_0_80": (true_merges / resolvable if resolvable else 0.0) >= 0.80,
+        },
+        "false_merge_examples": false_merge_examples,
+        "missed_pair_examples": missed_examples,
+    }
+
+
 def _metrics_for_shot(rows: Sequence[TrackObservation], frames: Mapping[int, ReferenceFrame], iou_threshold: float) -> dict[str, Any]:
     predicted: dict[int, list[TrackObservation]] = {}
     for row in rows:
