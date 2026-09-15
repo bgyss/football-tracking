@@ -11,6 +11,7 @@ The first version prioritizes **stable anonymous player IDs, teams, and trajecto
 - [Sample footage assessment](docs/evidence/footage-assessment.md): verified metadata and inspected frames.
 - [Accuracy, calibration, and replay guide](docs/accuracy-calibration-replay.md): how to move from the baseline to football accuracy, yard-space calibration, and cross-view identity.
 - [Local annotation and data generation](docs/annotation-and-data-generation.md): CVAT/SAM2/FiftyOne workflow for reviewing initial tracks and fine-tuning RF-DETR without hosted Roboflow services.
+- [Human review of the supplied All-22](docs/human-review-all22.md): source-frame, calibration, timing, tracking, and cross-shot identity checklist.
 - [Annotation schema](docs/annotation-schema.md): source-hashed reviewed boxes, NFL field landmarks, timing, and identity labels.
 
 Status: **implemented and locally benchmarked**. The supplied [sample video](data/all-22-lions-rams-sample.mp4) is 23.76 seconds and contains a sideline view followed by an apparent end-zone replay. The implementation includes local model inference and proxy benchmarks; no GPT-6 Astra request or footage upload was performed.

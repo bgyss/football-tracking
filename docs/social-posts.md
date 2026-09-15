@@ -151,6 +151,109 @@ A clean tracking overlay isn't identity evidence. Next for my All-22 project: hu
 
 Generic person weights proved the pipeline, not football accuracy. Next: fine-tune RF-DETR on wide shots, piles, officials, blur, and partial players—then test on held-out games. Detection labels and identity tracks stay separate. https://github.com/bgyss/football-tracking
 
+## Human Review and Calibration Campaign
+
+Drafted September 15, 2026. This campaign is about the review work needed before
+claiming that a player identity survives a replay cut. The posts distinguish the
+review tooling and evidence contract from the still-missing real-footage accuracy
+result.
+
+### LinkedIn Post 1: Human Review Is the Missing Layer
+
+The next phase of my All-22 project is less glamorous than a tracking overlay: making the evidence reviewable.
+
+The pipeline can produce tracklets and candidate cross-shot links. That is not enough to claim that an ID survived a replay cut. A human reviewer now needs to confirm source-frame shot boundaries, semantic field landmarks, timing anchors, player boxes, team labels, and intervals where identity is genuinely ambiguous.
+
+Calibration uses fit landmarks plus independent withheld landmarks. Cross-shot identity uses calibrated field position, reviewed play timing, team compatibility, and visible appearance. When those signals do not agree, the correct output is an abstention.
+
+The full-game review pack preserves original frame numbers and PTS, while keeping detector and Hough proposals separate from reviewed truth. The readiness check remains `not_ready` until reviewed calibration, timing, and identity references exist.
+
+That is slower than showing a confident overlay. It is also the path to a result I can measure.
+
+Project: https://github.com/bgyss/football-tracking
+
+#ComputerVision #SportsAnalytics #MachineLearning
+
+### LinkedIn Post 2: Cross-Shot Identity Starts With Geometry
+
+Image coordinates do not survive a camera cut. A player at pixel `(800, 400)` in a sideline shot tells me almost nothing about the same pixel in an end-zone replay.
+
+The fix I’m testing is a reviewed, time-scoped calibration timeline: map each shot into canonical field coordinates, align the shots with PTS-based play events, then compare player motion only where both views have valid support.
+
+The human review has a deliberate split. Some field landmarks fit the homography; separate landmarks are withheld to test it. Some timing events fit the play-time map; other events are held out to validate it. A mathematically neat fit without independent checks is not identity evidence.
+
+This is the kind of plumbing that rarely makes a demo look better. It determines whether the demo means anything.
+
+Project and review guide: https://github.com/bgyss/football-tracking
+
+#SportsTech #ComputerVision #DataQuality
+
+### LinkedIn Post 3: Ambiguity Belongs in the Dataset
+
+Football footage contains moments where even a careful reviewer cannot prove which player reappears after contact or a partial occlusion.
+
+I’m treating that uncertainty as part of the annotation contract. A reviewer can split a track, mark a frame ignored, leave a team unknown, or abstain from assigning a cross-shot global ID. The evaluator keeps those cases visible instead of turning guesses into false certainty.
+
+The goal is not to force every tracklet into a perfect one-to-one story. The goal is to measure accepted links, missed links, false merges, coverage, and the evidence behind each decision.
+
+If you work with sports video, I’d be interested in how you adjudicate identity around piles, crossings, and camera cuts.
+
+Project: https://github.com/bgyss/football-tracking
+
+#FootballAnalytics #ComputerVision #MLOps
+
+### Reddit Post: How I’m Reviewing All-22 Footage Before Claiming Cross-Shot Identity
+
+#### Title
+
+How I’m reviewing All-22 footage before claiming cross-shot identity
+
+#### Body
+
+I’m building an offline pipeline for player detection, tracking, field calibration, and replay-view identity in All-22 football footage. The next milestone is human review of the evidence, not another tracker demo.
+
+The review has four separate layers:
+
+- **Shot and play structure:** confirm every cut, camera label, source-frame interval, play grouping, and train/validation/test split.
+- **Field calibration:** mark semantic yard-line/hash or boundary intersections at each camera-motion keyframe. At least four points fit the homography and at least one independent point is withheld for validation.
+- **Play timing:** mark the same visible events in each view using source PTS. Fit correspondences and held-out validation events are kept separate, so the system cannot extrapolate through a replay edit or freeze.
+- **Identity reference:** label player boxes, shot-local track IDs, team evidence, visibility, contact confidence, and reviewed cross-shot `global_id` values. Unknown or ambiguous is a valid label.
+
+The review pack keeps detector proposals and Hough line suggestions explicitly unreviewed. The source frame number and PTS stay attached to every annotation, and the source hash is checked before evaluation.
+
+The current real-footage gate is still open: there is no reviewed calibration, timing, or MOT-style identity reference for the full game yet. That means the honest status is `not_ready`, not a fabricated IDF1 or coverage score.
+
+I’d welcome feedback from people who annotate sports video: which contact or replay situations deserve the densest review, and how do you record cases where a human cannot resolve the identity?
+
+Repo and review guide: https://github.com/bgyss/football-tracking
+
+### X Post 1: Review Before the Claim
+
+A tracking overlay is not identity evidence. I’m reviewing All-22 shot boundaries, field landmarks, PTS timing, player boxes, and ambiguous intervals before claiming that an ID survives a replay cut. Unknown is better than a false merge. https://github.com/bgyss/football-tracking
+
+### X Post 2: Calibration Before Cross-Shot Matching
+
+Pixel coordinates do not survive a camera cut. Cross-shot identity needs reviewed field calibration plus PTS-aligned play time, then a conservative match with explicit abstention when the evidence is weak. https://github.com/bgyss/football-tracking
+
+### X Post 3: The Review Pack
+
+I generated a source-hashed review pack for the full All-22. It preserves exact frames and PTS, while keeping detector/Hough proposals unreviewed until a human confirms landmarks, timing, tracks, teams, and cross-shot identity. https://github.com/bgyss/football-tracking
+
+### Media References for This Campaign
+
+Attach these tracked images directly to the posts when a visual is useful:
+
+- [Overview contact sheet](evidence/contact-sheet.jpg): a compact view of the sideline and end-zone sample footage.
+- [Cut frames 711–713](evidence/cut-frames-711-713.jpg): the three-frame camera-cut example used to explain why shot-local tracking state must reset.
+- [Native sideline frame](evidence/sideline-1s.jpg): useful for showing wide formation scale and small players.
+- [Native end-zone frame](evidence/endzone-14s.jpg): useful for showing a second viewpoint and more readable jersey context.
+
+For a local-only review post, attach the generated
+`artifacts/full-game-calibration-review-pack/contact-sheet.jpg` and, when rights
+permit, a short excerpt from `data/all-22-lions-rams.mp4`. Those files are local
+review artifacts and are not public repository URLs; use an authorized uploaded
+clip or image when posting publicly.
+
 ## Baseline Campaign
 
 ### LinkedIn
