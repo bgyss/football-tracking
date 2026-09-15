@@ -391,6 +391,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     analysis_config = {
         "schema_version": 2,
         "pipeline_version": package_version("football-tracking", "0.1.0"),
+        "evaluator_version": package_version("trackeval", "unavailable"),
+        "observation_schema_version": 2,
         "source_sha256": source_hash,
         "detector_hash": detector_hash,
         "detector_class_mapping_sha256": class_mapping_hash,
@@ -405,7 +407,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries],
         "window": {"start_frame": process_start, "end_frame": process_end},
         "resolver_policy": {"threshold": args.identity_threshold, "margin": args.identity_margin, "max_field_distance_yards": args.identity_max_distance_yards, "min_overlap_samples": 5, "min_overlap_duration_s": args.identity_min_overlap_duration_s, "sample_tolerance_s": 0.05, "max_position_uncertainty_yards": args.identity_max_position_uncertainty_yards},
-        "contact_policy": {"source": "bottom_center", "version": 1},
+        "contact_policy": {"source": "bottom_center", "version": 1, "min_ground_contact_confidence": 0.5},
         "team_sampling_policy": {"target_hz": 5.0, "feature_stride_frames": max(1, int(round(info.source_fps / 5.0)))},
     }
     analysis_hash = config_hash(analysis_config)
@@ -544,7 +546,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     team_prototypes = _load_prototypes(args.team_prototypes)
     teams = resolve_teams(summaries, prototypes=team_prototypes)
     identity_links: list[IdentityLink] = []
-    link_report: dict[str, Any] = {"status": "not_attempted", "reason": "--play-alignment was not provided"}
+    link_report: dict[str, Any] = {"schema_version": 2, "status": "not_attempted", "reason": "--play-alignment was not provided"}
     observations: list[Observation] = []
     for row in raw_tracks:
         identity_tracklet_id = segment_for_observation.get((row.tracklet_id, row.frame_index), row.tracklet_id)
@@ -652,6 +654,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         link_report.setdefault("timing_status", "validated_pts_map" if alignment.timing_eligible else "unverified_alignment_source" if alignment.time_map is not None and not alignment.source_hash_validated else "reviewed_pts_map" if alignment.time_map is not None else "legacy_unvalidated_equal_rate")
         if alignment.timing_report is not None:
             link_report.setdefault("timing_report", dict(alignment.timing_report))
+        link_report.setdefault("alignment_source_hash_validated", alignment.source_hash_validated)
+        link_report.setdefault("calibration_status", "timeline_withheld_validated" if calibration_timeline is not None and calibration_timeline.identity_eligible_shots() else "legacy_static_unvalidated_compatibility" if calibrations else "not_provided")
         link_report.setdefault("calibration_quality", calibration_quality)
         link_report.setdefault("team_evidence", {tracklet_id: {"team": evidence.team, "score": evidence.score, "crop_count": evidence.crop_count, "assignment_coverage": evidence.assignment_coverage, "ambiguity": evidence.ambiguity} for tracklet_id, evidence in sorted(teams.items())})
     identity_map = stable_anonymous_ids(
@@ -669,6 +673,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     for tracklet_id, player_id in identity_map.items():
         by_player.setdefault(player_id, set()).add(tracklet_id.split(":", 1)[0])
     link_report.update({
+        "schema_version": 2,
         "shot_count": len(boundaries),
         "tracklet_count": len(tracklet_ids),
         "player_id_count": len(set(identity_map.values())),
@@ -728,7 +733,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             quality_report["reference_sha256"] = sha256_file(args.reviewed_reference)
             quality_report["evaluation_window"] = {"start_frame": process_start, "end_frame": process_end}
             quality_report["calibration"] = calibration_quality
-            contact_report = evaluate_ground_contact_positions(observations, evaluation_reference)
+            contact_report = evaluate_ground_contact_positions(observations, evaluation_reference, min_contact_confidence=0.5)
             quality_report["ground_contact"] = contact_report
             quality_report["team"] = evaluate_team_assignment(observations, evaluation_reference)
             quality_report["cross_shot"] = evaluate_cross_shot_identity(

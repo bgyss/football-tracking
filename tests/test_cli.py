@@ -174,6 +174,7 @@ def test_run_emits_identity_links_evidence_and_defaults_to_unlinked(tmp_path) ->
 
     report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
     assert report["status"] == "not_attempted"
+    assert report["schema_version"] == 2
     assert report["reason"] == "--play-alignment was not provided"
     assert report["links"] == []
     assert report["cross_shot_player_ids"] == 0
@@ -405,6 +406,8 @@ def test_run_reaches_a_resolved_cross_shot_outcome_from_view_invariant_evidence(
     assert report["status"] == "resolved"
     assert report["candidate_pairs"] > 0
     assert report["accepted_links"] > 0
+    assert report["calibration_status"] == "timeline_withheld_validated"
+    assert report["alignment_source_hash_validated"] is True
     assert report["cross_shot_player_ids"] > 0
     assert {link["decision"] for link in report["links"]} == {"same"}
     assert report["player_id_count"] < report["tracklet_count"]
@@ -462,6 +465,8 @@ def test_analysis_identity_includes_calibration_provenance(tmp_path) -> None:
     assert config["schema_version"] == 2
     assert config["analysis_hash"] == first["config_hash"]
     assert config["source_sha256"] == first["input_sha256"]
+    assert config["analysis"]["observation_schema_version"] == 2
+    assert "evaluator_version" in config["analysis"]
 
 
 def test_run_supports_bounded_source_windows_and_records_scope(tmp_path) -> None:

@@ -101,6 +101,8 @@ def test_homography_reports_pixel_and_field_residuals_in_their_own_units() -> No
     assert transform.median_error_yards < 0.01
     assert transform.reprojection_threshold_px == 3.0
     assert transform.status == "unvalidated"
+    assert set(transform.inlier_indices) | set(transform.outlier_indices) == set(range(transform.point_count))
+    assert not set(transform.inlier_indices) & set(transform.outlier_indices)
 
 
 def test_homography_uses_withheld_landmarks_for_validation_status() -> None:
@@ -117,6 +119,9 @@ def test_homography_uses_withheld_landmarks_for_validation_status() -> None:
     )
     projected = project_observation(observation, transform)
     assert projected.position_uncertainty_yards == pytest.approx(0.0)
+    assert transform.local_projection_sensitivity(ImagePoint(50, 50)) > 0.0
+    sensitivity_projected = project_observation(observation, transform, pixel_uncertainty_px=1.0)
+    assert sensitivity_projected.position_uncertainty_yards >= transform.local_projection_sensitivity(ImagePoint(15, 50))
 
 
 def test_projection_rejects_nonfinite_or_off_field_contact() -> None:

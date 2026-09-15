@@ -244,11 +244,21 @@ worktree, while the remaining boxes stay open until their evidence exists.
 The current worktree implements the first safety and data-contract slice:
 
 - calibration now fits with a pixel-space RANSAC threshold, reports pixel and yard residuals separately, validates withheld points, rejects invalid projections, and supports a PTS-scoped timeline plus tested motion composition;
+- calibration diagnostics retain explicit fit inlier/outlier indices and expose a local projection-sensitivity estimate for future contact uncertainty policy;
+- `propagate_calibration_timeline` now composes approved field-motion steps and truncates support after a frozen maximum PTS gap, retaining source keyframe provenance;
 - identity assignment has explicit unmatched choices, global ambiguity margins, component conflict rejection, conservative team evidence, reviewed split overlays, and an all-aligned-view play resolver;
 - evaluation keeps the reviewed shared-player denominator independent of detections, reports mixed/unattributed/component cases, and exposes standard TrackEval metrics separately from diagnostics;
 - versioned annotation/field contracts and an ignored full-game review-pack generator are available.
 - reviewed landmark records can be converted directly with `timeline_from_landmark_records` or `scripts/fit_calibration_timeline.py`; missing PTS or withheld points are rejected.
+- reviewed player annotations can be converted with `scripts/build_reviewed_reference.py` into the strict MOT/reference and cross-shot identity contract used by evaluation;
+- frame-level reviewed labels now preserve inspected empty and ignored frames, preventing omitted annotations from becoming implicit negative ground truth;
+- `scripts/check_identity_readiness.py` now audits source-hashed calibration, timing, and reviewed-reference prerequisites before promotion;
+- the manifest-to-reference conversion has an end-to-end source-hash fixture covering reviewed boxes, team/contact labels, and global identity fields;
 - `calibration-quality.json` separates fit/withheld geometry status from player-contact error.
+- calibration-quality reports and observation/evaluator provenance carry explicit schema and evaluator versions for reproducibility;
+- ground-contact evaluation now reports per-shot metrics and requires every evaluated shot to pass its position gate;
+- ground-contact evaluation preserves an explicit confidence threshold and reports low-confidence contacts as excluded from the denominator;
+- team evaluation now reports per-shot accuracy/coverage and requires every evaluated shot to pass the team gate;
 - the CLI now prevents legacy static homographies from creating cross-shot merges; positive resolution requires schema-v2, source-hashed, withheld-validated calibration.
 - one-anchor timing is now exportable for compatibility but cannot create a cross-shot merge; positive resolution requires held-out PTS timing validation.
 - cross-shot candidates carry aligned calibration/contact uncertainty; high-uncertainty pairs are rejected before assignment.
@@ -286,11 +296,22 @@ The current worktree implements the first safety and data-contract slice:
 - analysis identity includes the source hash, pipeline version, and tracker CMC settings; cache hits read proxy provenance and become non-promotable when that provenance is absent;
 - bounded batch execution honors declared shot ranges even when a play window starts after source frame zero;
 - cross-shot candidate generation now preserves per-pair overlap, distance, shape, team, uncertainty, score, and rejection evidence in the resolver report;
+- resolved link reports retain timing and calibration provenance alongside the resolver decisions;
+- `identity-links.json` now carries a schema version so abstentions and accepted-link reports share a stable artifact contract;
+- unreviewed shot scouting now uses a bounded thumbnail buffer and relative-spike detector; it is a candidate generator only and requires review before any shot or play split is used;
 - the supplied full-game source now has an ignored, exact-PTS scouting pack at `artifacts/full-game-calibration-review-pack/` with 12 unreviewed frames and 1,200 line hints.
 
 Real footage acceptance is still a data-gated milestone: the generated full-game pack is
 unreviewed, and no accepted identity or calibration score should be reported until the
 reviewed landmarks, timing correspondences, local tracks, and cross-shot map exist.
+
+| Evidence gate | Current state | Required next artifact |
+| --- | --- | --- |
+| Shot boundaries and play grouping | scouting pack only; no reviewed full-game inventory retained | reviewed shot/play manifest with source frame and PTS ranges |
+| Geometry | exact-PTS frames and Hough hints only; no reviewed landmarks | reviewed fit/withheld landmark records, then schema-v2 timeline |
+| Timing | no reviewed cross-view event correspondences | reviewed fit events plus held-out validation events |
+| Tracking and teams | no real detector/reference run in this worktree | real detector cache, reviewed MOT/team labels, and per-shot TrackEval report |
+| Cross-shot identity | resolver abstains without all prerequisites | reviewed cross-shot map and a sealed per-play promotion report |
 
 Tasks 1–8 can continue against fixtures and reviewed overlays while annotations are prepared. Real acceptance remains blocked until independent geometry, timing and identity labels exist. The user has supplied footage useful for producing them; this plan does not pretend raw video is already reviewed calibration data.
 

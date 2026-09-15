@@ -279,6 +279,15 @@ def test_ground_contact_evaluation_reports_position_error_and_missing_contacts()
     assert report["evaluated_contacts"] == 1
     assert report["invalid_or_missing"] == 1
     assert report["median_error_yards"] == 1.0
+    assert report["gate"]["every_shot_gate_passes"] is False
+
+
+def test_ground_contact_confidence_excludes_uncertain_contacts() -> None:
+    reference = {"shot-0": {0: ReferenceFrame(0, 1, True, False, (ReferenceObject("a", (0, 0, 10, 10), (1.0, 2.0), ground_contact_confidence=0.2),))}}
+    observation = Observation(run_id="r", shot_id="shot-0", frame_index=0, pts=0, time_base=(1, 60), tracklet_id="shot-0:t1", player_id="P01", bbox_xyxy_px=(0, 0, 10, 10), detection_score=0.9, team="DET", team_score=1.0, jersey_number=None, field_xy_yards=(1.0, 2.0), position_source="bottom_center", calibration_id="cal", identity_version=2)
+    report = evaluate_ground_contact_positions([observation], reference)
+    assert report["status"] == "not_evaluated"
+    assert report["excluded_low_confidence"] == 1
 
 
 def test_team_assignment_reports_accuracy_and_coverage() -> None:
@@ -291,3 +300,5 @@ def test_team_assignment_reports_accuracy_and_coverage() -> None:
     assert report["accuracy"] == 0.5
     assert report["coverage"] == 1.0
     assert report["gate"]["accuracy_at_least_0_98"] is False
+    assert report["per_shot"]["shot-0"]["accuracy"] == 0.5
+    assert report["gate"]["every_shot_gate_passes"] is False

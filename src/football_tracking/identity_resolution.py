@@ -49,6 +49,7 @@ class PlayResolution:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": 2,
             "play_id": self.play_id,
             "status": self.status,
             "reason": self.reason,

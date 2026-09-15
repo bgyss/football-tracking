@@ -107,6 +107,8 @@ class CalibrationTimeline:
                             "withheld_errors_yards": estimate.homography.withheld_errors_yards,
                             "inlier_count": estimate.homography.inlier_count,
                             "point_count": estimate.homography.point_count,
+                            "inlier_indices": estimate.homography.inlier_indices,
+                            "outlier_indices": estimate.homography.outlier_indices,
                             "reprojection_threshold_px": estimate.homography.reprojection_threshold_px,
                             "calibration_id": estimate.homography.calibration_id,
                             "status": estimate.homography.status,
@@ -119,6 +121,88 @@ class CalibrationTimeline:
         statuses = {estimate.status for values in self._estimates.values() for estimate in values}
         overall_status = "valid" if statuses == {"valid"} else "invalid" if statuses == {"invalid"} else "partial" if "invalid" in statuses or "partial" in statuses or len(statuses) > 1 else "unvalidated"
         return {"schema_version": 2, "status": overall_status, "shots": shots}
+
+
+def _propagated_support_polygon(
+    polygon: Sequence[tuple[float, float]],
+    image_motion: Sequence[Sequence[float]],
+) -> tuple[tuple[float, float], ...]:
+    if not polygon:
+        return ()
+    points = np.asarray(polygon, dtype=np.float32).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(points, np.asarray(image_motion, dtype=np.float64)).reshape(-1, 2)
+    if not np.all(np.isfinite(projected)):
+        return ()
+    return tuple((float(point[0]), float(point[1])) for point in projected)
+
+
+def propagate_calibration_timeline(
+    timeline: CalibrationTimeline,
+    motions_by_shot: Mapping[str, Sequence[tuple[int, Sequence[Sequence[float]]]]],
+    *,
+    max_gap_pts: int,
+) -> CalibrationTimeline:
+    """Propagate validated keyframes across bounded field-motion steps.
+
+    Each motion matrix maps the immediately preceding image into the current
+    image.  Propagation composes ``H_current = H_previous @ inv(G)`` and emits
+    a new PTS interval for every accepted step.  A gap larger than
+    ``max_gap_pts`` terminates support; no estimate is extrapolated beyond the
+    last bounded interval.  This helper consumes motion proposals only and
+    never upgrades an unvalidated keyframe to an identity-eligible result.
+    """
+
+    if not isinstance(max_gap_pts, int) or isinstance(max_gap_pts, bool) or max_gap_pts <= 0:
+        raise ValueError("max_gap_pts must be a positive integer")
+    unknown_shots = sorted(set(motions_by_shot) - set(timeline.shots()))
+    if unknown_shots:
+        raise CalibrationTimelineError(f"motion proposals reference unknown shots: {unknown_shots[:5]}")
+    result: dict[str, list[CalibrationEstimate]] = {}
+    for shot_id in timeline.shots():
+        raw_motions = list(motions_by_shot.get(shot_id, ()))
+        if any(not isinstance(item, (tuple, list)) or len(item) != 2 for item in raw_motions):
+            raise CalibrationTimelineError(f"motion proposals for {shot_id} must be (pts, matrix) pairs")
+        motions = sorted(raw_motions, key=lambda item: item[0])
+        previous_motion_pts: int | None = None
+        for pts, _ in motions:
+            if not isinstance(pts, int) or isinstance(pts, bool) or pts < 0:
+                raise CalibrationTimelineError(f"motion proposal for {shot_id} has invalid PTS")
+            if previous_motion_pts is not None and pts <= previous_motion_pts:
+                raise CalibrationTimelineError(f"motion proposals for {shot_id} must have strictly increasing PTS")
+            previous_motion_pts = pts
+        shot_output: list[CalibrationEstimate] = []
+        for estimate in timeline._estimates.get(shot_id, ()):
+            source_end = estimate.pts_end
+            steps = [(pts, motion) for pts, motion in motions if pts > estimate.pts_start and (source_end is None or pts < source_end)]
+            current_start = estimate.pts_start
+            current_homography = estimate.homography
+            current_polygon = estimate.support_polygon_px
+            stopped = False
+            for pts, motion in steps:
+                gap = pts - current_start
+                if gap > max_gap_pts:
+                    bounded_end = current_start + max_gap_pts
+                    if source_end is not None:
+                        bounded_end = min(bounded_end, source_end)
+                    if bounded_end > current_start:
+                        shot_output.append(replace(estimate, calibration_id=f"{estimate.calibration_id}:bounded-{current_start}", pts_start=current_start, pts_end=bounded_end, homography=current_homography, support_polygon_px=current_polygon))
+                    stopped = True
+                    break
+                shot_output.append(replace(estimate, calibration_id=f"{estimate.calibration_id}:prop-{current_start}", pts_start=current_start, pts_end=pts, homography=current_homography, support_polygon_px=current_polygon))
+                current_homography = propagate_homography(current_homography, motion)
+                current_polygon = _propagated_support_polygon(current_polygon, motion)
+                current_start = pts
+            if stopped:
+                continue
+            final_end = source_end
+            if steps:
+                # The final propagated estimate retains the source keyframe's
+                # declared end, or remains open only when the source did.
+                shot_output.append(replace(estimate, calibration_id=f"{estimate.calibration_id}:prop-{current_start}", pts_start=current_start, pts_end=final_end, homography=current_homography, support_polygon_px=current_polygon))
+            else:
+                shot_output.append(estimate)
+        result[shot_id] = shot_output
+    return CalibrationTimeline(result)
 
 
 def _points(config: Mapping[str, object]) -> tuple[list[ImagePoint], list[FieldPoint], list[ImagePoint] | None, list[FieldPoint] | None]:
@@ -185,8 +269,26 @@ def load_calibration_timeline(path: str | Path, *, source_sha256: str | None = N
                     matrix = tuple(tuple(float(item) for item in row) for row in serialized["matrix"])
                     if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
                         raise ValueError("matrix must be 3x3")
+                    inlier_indices = tuple(int(item) for item in serialized.get("inlier_indices", ()))
+                    outlier_indices = tuple(int(item) for item in serialized.get("outlier_indices", ()))
                     homography = Homography(
-                        matrix, float(serialized.get("fit_error_px", serialized.get("median_error_px", float("inf")))), float(serialized.get("max_error_px", float("inf"))), int(serialized["inlier_count"]), int(serialized["point_count"]), float(serialized.get("reprojection_threshold_px", 3.0)), str(serialized.get("calibration_id", f"serialized-{shot_id}-{index}")), float(serialized.get("median_error_yards", float("inf"))), float(serialized.get("max_error_yards", float("inf"))), None if serialized.get("withheld_median_error_yards") is None else float(serialized["withheld_median_error_yards"]), None if serialized.get("withheld_p95_error_yards") is None else float(serialized["withheld_p95_error_yards"]), int(serialized.get("withheld_point_count", 0)), str(serialized.get("status", config.get("status", "unvalidated"))), serialized.get("reason") if isinstance(serialized.get("reason"), str) else None, tuple(float(item) for item in serialized.get("withheld_errors_yards", ())),
+                        matrix,
+                        float(serialized.get("fit_error_px", serialized.get("median_error_px", float("inf")))),
+                        float(serialized.get("max_error_px", float("inf"))),
+                        int(serialized["inlier_count"]),
+                        int(serialized["point_count"]),
+                        float(serialized.get("reprojection_threshold_px", 3.0)),
+                        str(serialized.get("calibration_id", f"serialized-{shot_id}-{index}")),
+                        float(serialized.get("median_error_yards", float("inf"))),
+                        float(serialized.get("max_error_yards", float("inf"))),
+                        None if serialized.get("withheld_median_error_yards") is None else float(serialized["withheld_median_error_yards"]),
+                        None if serialized.get("withheld_p95_error_yards") is None else float(serialized["withheld_p95_error_yards"]),
+                        int(serialized.get("withheld_point_count", 0)),
+                        str(serialized.get("status", config.get("status", "unvalidated"))),
+                        serialized.get("reason") if isinstance(serialized.get("reason"), str) else None,
+                        tuple(float(item) for item in serialized.get("withheld_errors_yards", ())),
+                        inlier_indices,
+                        outlier_indices,
                     )
                 except (KeyError, TypeError, ValueError) as error:
                     raise CalibrationTimelineError(f"invalid serialized homography {shot_id}:{index}") from error
@@ -299,14 +401,14 @@ def timeline_quality_report(timeline: CalibrationTimeline) -> dict[str, object]:
         for estimate in timeline._estimates.get(shot_id, ()):
             estimate_errors = list(estimate.homography.withheld_errors_yards)
             errors.extend(estimate_errors)
-            entries.append({"calibration_id": estimate.calibration_id, "pts_start": estimate.pts_start, "pts_end": estimate.pts_end, "status": estimate.status, "fit_error_px": estimate.homography.fit_error_px, "max_error_px": estimate.homography.max_error_px, "median_fit_error_yards": estimate.homography.median_error_yards, "withheld_point_count": estimate.homography.withheld_point_count, "median_error_yards": estimate.homography.withheld_median_error_yards, "p95_error_yards": estimate.homography.withheld_p95_error_yards, "reason": estimate.reason})
+            entries.append({"calibration_id": estimate.calibration_id, "pts_start": estimate.pts_start, "pts_end": estimate.pts_end, "status": estimate.status, "fit_error_px": estimate.homography.fit_error_px, "max_error_px": estimate.homography.max_error_px, "median_fit_error_yards": estimate.homography.median_error_yards, "inlier_indices": estimate.homography.inlier_indices, "outlier_indices": estimate.homography.outlier_indices, "withheld_point_count": estimate.homography.withheld_point_count, "median_error_yards": estimate.homography.withheld_median_error_yards, "p95_error_yards": estimate.homography.withheld_p95_error_yards, "reason": estimate.reason})
         values[shot_id] = {"keyframes": entries}
     if not errors:
         statuses = {entry["status"] for shot in values.values() for entry in shot["keyframes"]}
-        return {"status": "invalid" if "invalid" in statuses else "unvalidated", "shots": values, "reason": "no withheld landmark errors"}
+        return {"schema_version": 1, "status": "invalid" if "invalid" in statuses else "unvalidated", "shots": values, "reason": "no withheld landmark errors"}
     median = float(np.median(np.asarray(errors, dtype=float)))
     p95 = float(np.percentile(np.asarray(errors, dtype=float), 95))
-    return {"status": "valid" if median <= 1.0 and p95 <= 2.0 and all(entry["status"] == "valid" for shot in values.values() for entry in shot["keyframes"]) else "invalid", "shots": values, "withheld_point_count": len(errors), "median_error_yards": median, "p95_error_yards": p95, "gate": {"median_at_most_1_yard": median <= 1.0, "p95_at_most_2_yards": p95 <= 2.0}}
+    return {"schema_version": 1, "status": "valid" if median <= 1.0 and p95 <= 2.0 and all(entry["status"] == "valid" for shot in values.values() for entry in shot["keyframes"]) else "invalid", "shots": values, "withheld_point_count": len(errors), "median_error_yards": median, "p95_error_yards": p95, "gate": {"median_at_most_1_yard": median <= 1.0, "p95_at_most_2_yards": p95 <= 2.0}}
 
 
 def propagate_homography(keyframe: Homography, image_motion: Sequence[Sequence[float]]) -> Homography:
@@ -338,6 +440,8 @@ def propagate_homography(keyframe: Homography, image_motion: Sequence[Sequence[f
         keyframe.status,
         keyframe.reason,
         keyframe.withheld_errors_yards,
+        keyframe.inlier_indices,
+        keyframe.outlier_indices,
     )
 
 

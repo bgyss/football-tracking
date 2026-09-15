@@ -190,6 +190,26 @@ UV_CACHE_DIR=.uv-cache uv run python scripts/fit_calibration_timeline.py \
   --output artifacts/calibration-timeline.json
 ```
 
+Build the reviewed MOT/reference and cross-shot identity map from the same manifest:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/build_reviewed_reference.py \
+  --annotations /path/to/reviewed-manifest.json \
+  --source data/all-22-lions-rams.mp4 \
+  --output artifacts/reviewed-reference.json
+```
+
+Audit the required source-hashed inputs before running evaluation:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/check_identity_readiness.py \
+  --source data/all-22-lions-rams.mp4 \
+  --annotations /path/to/reviewed-manifest.json \
+  --calibration artifacts/calibration-timeline.json \
+  --play-alignment /path/to/reviewed-play-alignments.json \
+  --reviewed-reference artifacts/reviewed-reference.json
+```
+
 Long recordings should be processed in source-frame windows with `--start-frame` and
 `--end-frame`. Window outputs record their scope in `metrics.json`; a partial detector
 cache is never treated as a complete cache for another window, and windowed annotated

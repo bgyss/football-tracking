@@ -29,6 +29,7 @@ class ReferenceObject:
     bbox_xyxy: tuple[float, float, float, float]
     ground_contact_xy_yards: tuple[float, float] | None = None
     team: str | None = None
+    ground_contact_confidence: float | None = None
 
     def __post_init__(self) -> None:
         if not self.identifier.strip():
@@ -42,6 +43,10 @@ class ReferenceObject:
                 raise ValueError("reference ground contact must lie on the canonical field") from error
         if self.team is not None and not self.team.strip():
             raise ValueError("reference team label must be non-empty")
+        if self.ground_contact_confidence is not None and (not np.isfinite(self.ground_contact_confidence) or not 0.0 <= self.ground_contact_confidence <= 1.0):
+            raise ValueError("ground contact confidence must be between 0 and 1")
+        if self.ground_contact_confidence is not None and self.ground_contact_xy_yards is None:
+            raise ValueError("ground contact confidence requires ground contact coordinates")
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,8 +141,13 @@ def load_reviewed_mot_reference(path: str | Path, *, source_sha256: str | None =
                     if len(contact) != 2 or not np.all(np.isfinite(np.asarray(contact, dtype=float))):
                         raise EvaluationError(f"invalid ground contact in {shot_id}:{source_frame}")
                 team = None if raw_object.get("team") is None else str(raw_object["team"])
+                raw_contact_confidence = raw_object.get("ground_contact_confidence", raw_object.get("contact_confidence"))
                 try:
-                    objects.append(ReferenceObject(identifier, box, contact, team))
+                    contact_confidence = None if raw_contact_confidence is None else float(raw_contact_confidence)
+                except (TypeError, ValueError) as error:
+                    raise EvaluationError(f"invalid ground contact confidence in {shot_id}:{source_frame}") from error
+                try:
+                    objects.append(ReferenceObject(identifier, box, contact, team, contact_confidence))
                 except ValueError as error:
                     raise EvaluationError(f"invalid object in {shot_id}:{source_frame}") from error
             raw_pts = raw_frame.get("pts")
@@ -449,11 +459,14 @@ def evaluate_ground_contact_positions(
     reference: Mapping[str, Mapping[int, ReferenceFrame]],
     *,
     iou_threshold: float = 0.5,
+    min_contact_confidence: float = 0.5,
 ) -> dict[str, Any]:
     """Measure calibrated bottom-center/contact positions against reviewed contacts."""
 
     if not 0.0 < iou_threshold <= 1.0:
         raise ValueError("iou_threshold must be in (0, 1]")
+    if not np.isfinite(min_contact_confidence) or not 0.0 <= min_contact_confidence <= 1.0:
+        raise ValueError("min_contact_confidence must be between 0 and 1")
     by_frame: dict[tuple[str, int], list[Observation]] = {}
     for observation in observations:
         by_frame.setdefault((observation.shot_id, observation.frame_index), []).append(observation)
@@ -461,9 +474,15 @@ def evaluate_ground_contact_positions(
     evaluated = 0
     invalid = 0
     examples: list[dict[str, object]] = []
+    excluded_low_confidence = 0
+    per_shot: dict[str, dict[str, Any]] = {}
     for shot_id, frames in reference.items():
+        shot_errors: list[float] = []
+        shot_evaluated = 0
+        shot_invalid = 0
         for frame_index, frame in frames.items():
-            contacts = [obj for obj in frame.objects if obj.ground_contact_xy_yards is not None]
+            contacts = [obj for obj in frame.objects if obj.ground_contact_xy_yards is not None and (obj.ground_contact_confidence is None or obj.ground_contact_confidence >= min_contact_confidence)]
+            excluded_low_confidence += sum(1 for obj in frame.objects if obj.ground_contact_xy_yards is not None and obj.ground_contact_confidence is not None and obj.ground_contact_confidence < min_contact_confidence)
             if not frame.labeled or frame.ignore or not contacts:
                 continue
             predictions = by_frame.get((shot_id, frame_index), [])
@@ -474,18 +493,39 @@ def evaluate_ground_contact_positions(
                 contact = contacts[contact_index].ground_contact_xy_yards
                 if predicted.field_xy_yards is None:
                     invalid += 1
+                    shot_invalid += 1
                     continue
                 error = float(np.linalg.norm(np.asarray(predicted.field_xy_yards) - np.asarray(contact)))
                 if not np.isfinite(error):
                     invalid += 1
+                    shot_invalid += 1
                     continue
                 evaluated += 1
+                shot_evaluated += 1
                 errors.append(error)
+                shot_errors.append(error)
                 if len(examples) < 20:
                     examples.append({"shot_id": shot_id, "frame_index": frame_index, "reference_id": contacts[contact_index].identifier, "error_yards": error})
             invalid += len(contacts) - len(matched_contacts)
+            shot_invalid += len(contacts) - len(matched_contacts)
+        if shot_evaluated:
+            shot_values = np.asarray(shot_errors, dtype=float)
+            shot_median = float(np.median(shot_values))
+            shot_p95 = float(np.percentile(shot_values, 95))
+            shot_fraction = shot_evaluated / (shot_evaluated + shot_invalid) if shot_evaluated + shot_invalid else 0.0
+            per_shot[shot_id] = {
+                "status": "evaluated",
+                "evaluated_contacts": shot_evaluated,
+                "invalid_or_missing": shot_invalid,
+                "median_error_yards": shot_median,
+                "p95_error_yards": shot_p95,
+                "valid_fraction": shot_fraction,
+                "gate": {"median_at_most_1_5_yards": shot_median <= 1.5, "valid_fraction_at_least_0_90": shot_fraction >= 0.90},
+            }
+        elif shot_invalid:
+            per_shot[shot_id] = {"status": "not_evaluated", "evaluated_contacts": 0, "invalid_or_missing": shot_invalid}
     if not evaluated:
-        return {"status": "not_evaluated", "reason": "reference carries no matched ground-contact positions", "evaluated_contacts": 0, "invalid_or_missing": invalid}
+        return {"status": "not_evaluated", "reason": "reference carries no matched ground-contact positions", "evaluated_contacts": 0, "invalid_or_missing": invalid, "excluded_low_confidence": excluded_low_confidence, "min_contact_confidence": min_contact_confidence, "per_shot": per_shot}
     values = np.asarray(errors, dtype=float)
     median = float(np.median(values))
     p95 = float(np.percentile(values, 95))
@@ -495,10 +535,17 @@ def evaluate_ground_contact_positions(
         "iou_threshold": iou_threshold,
         "evaluated_contacts": evaluated,
         "invalid_or_missing": invalid,
+        "excluded_low_confidence": excluded_low_confidence,
+        "min_contact_confidence": min_contact_confidence,
         "median_error_yards": median,
         "p95_error_yards": p95,
         "valid_fraction": valid_fraction,
-        "gate": {"median_at_most_1_5_yards": median <= 1.5, "valid_fraction_at_least_0_90": valid_fraction >= 0.90},
+        "per_shot": per_shot,
+        "gate": {
+            "median_at_most_1_5_yards": median <= 1.5,
+            "valid_fraction_at_least_0_90": valid_fraction >= 0.90,
+            "every_shot_gate_passes": all(report.get("status") == "evaluated" and report.get("gate", {}).get("median_at_most_1_5_yards") and report.get("gate", {}).get("valid_fraction_at_least_0_90") for report in per_shot.values()),
+        },
         "examples": examples,
     }
 
@@ -519,7 +566,11 @@ def evaluate_team_assignment(
     assigned = correct = 0
     unknown_reference = 0
     examples: list[dict[str, object]] = []
+    per_shot: dict[str, dict[str, Any]] = {}
     for shot_id, frames in reference.items():
+        shot_assigned = 0
+        shot_correct = 0
+        shot_missing = 0
         for frame_index, frame in frames.items():
             objects = [obj for obj in frame.objects if obj.team is not None and obj.team != "unknown"]
             if not frame.labeled or frame.ignore or not objects:
@@ -529,18 +580,27 @@ def evaluate_team_assignment(
             for object_index, prediction_index, _ in _injective_matches(objects, predictions, iou_threshold):
                 matched_objects.add(object_index)
                 assigned += 1
+                shot_assigned += 1
                 prediction = predictions[prediction_index]
                 expected = objects[object_index].team
                 if prediction.team == expected:
                     correct += 1
+                    shot_correct += 1
                 if len(examples) < 20:
                     examples.append({"shot_id": shot_id, "frame_index": frame_index, "reference_id": objects[object_index].identifier, "expected_team": expected, "predicted_team": prediction.team})
             unknown_reference += len(objects) - len(matched_objects)
+            shot_missing += len(objects) - len(matched_objects)
+        if shot_assigned:
+            shot_accuracy = shot_correct / shot_assigned
+            shot_coverage = shot_assigned / (shot_assigned + shot_missing) if shot_assigned + shot_missing else 0.0
+            per_shot[shot_id] = {"status": "evaluated", "assigned": shot_assigned, "correct": shot_correct, "unknown_or_missing": shot_missing, "accuracy": shot_accuracy, "coverage": shot_coverage, "gate": {"accuracy_at_least_0_98": shot_accuracy >= 0.98, "coverage_at_least_0_95": shot_coverage >= 0.95}}
+        elif shot_missing:
+            per_shot[shot_id] = {"status": "not_evaluated", "assigned": 0, "unknown_or_missing": shot_missing}
     if not assigned:
-        return {"status": "not_evaluated", "reason": "reference carries no matched team labels", "assigned": 0, "unknown_or_missing": unknown_reference}
+        return {"status": "not_evaluated", "reason": "reference carries no matched team labels", "assigned": 0, "unknown_or_missing": unknown_reference, "per_shot": per_shot}
     accuracy = correct / assigned
     coverage = assigned / (assigned + unknown_reference) if assigned + unknown_reference else 0.0
-    return {"status": "evaluated", "assigned": assigned, "correct": correct, "unknown_or_missing": unknown_reference, "accuracy": accuracy, "coverage": coverage, "gate": {"accuracy_at_least_0_98": accuracy >= 0.98, "coverage_at_least_0_95": coverage >= 0.95}, "examples": examples}
+    return {"status": "evaluated", "assigned": assigned, "correct": correct, "unknown_or_missing": unknown_reference, "accuracy": accuracy, "coverage": coverage, "per_shot": per_shot, "gate": {"accuracy_at_least_0_98": accuracy >= 0.98, "coverage_at_least_0_95": coverage >= 0.95, "every_shot_gate_passes": all(report.get("status") == "evaluated" and report.get("gate", {}).get("accuracy_at_least_0_98") and report.get("gate", {}).get("coverage_at_least_0_95") for report in per_shot.values())}, "examples": examples}
 
 
 def _metrics_for_shot(rows: Sequence[TrackObservation], frames: Mapping[int, ReferenceFrame], iou_threshold: float) -> dict[str, Any]:
@@ -850,7 +910,7 @@ def evaluate_promotion_gates(
             if not isinstance(contact_gate, Mapping):
                 reasons.append("ground-contact gate evidence is missing")
                 missing_evidence = True
-            elif not bool(contact_gate.get("median_at_most_1_5_yards", False)) or not bool(contact_gate.get("valid_fraction_at_least_0_90", False)):
+            elif not bool(contact_gate.get("median_at_most_1_5_yards", False)) or not bool(contact_gate.get("valid_fraction_at_least_0_90", False)) or not bool(contact_gate.get("every_shot_gate_passes", False)):
                 reasons.append("ground-contact position error is below the promotion gate")
     if team_report is not None:
         if team_report.get("status") != "evaluated":
@@ -861,7 +921,7 @@ def evaluate_promotion_gates(
             if not isinstance(team_gate, Mapping):
                 reasons.append("team assignment gate evidence is missing")
                 missing_evidence = True
-            elif not bool(team_gate.get("accuracy_at_least_0_98", False)) or not bool(team_gate.get("coverage_at_least_0_95", False)):
+            elif not bool(team_gate.get("accuracy_at_least_0_98", False)) or not bool(team_gate.get("coverage_at_least_0_95", False)) or not bool(team_gate.get("every_shot_gate_passes", False)):
                 reasons.append("team assignment is below the promotion gate")
     status = "passed" if not reasons else "not_evaluated" if missing_evidence else "failed"
     return {"status": status, "thresholds": {"min_idf1": min_idf1, "max_id_switches_per_shot": max_id_switches_per_shot, "min_cross_shot_coverage": min_cross_shot_coverage}, "reasons": reasons}

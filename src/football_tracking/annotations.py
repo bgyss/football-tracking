@@ -41,6 +41,7 @@ class AnnotationManifest:
     shots: dict[str, ShotAnnotation]
     annotations: tuple[dict[str, Any], ...]
     landmarks: tuple[dict[str, Any], ...] = ()
+    frame_labels: tuple[dict[str, Any], ...] = ()
 
 
 def _validate_review_metadata(raw: Mapping[str, Any], label: str) -> None:
@@ -226,7 +227,35 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
         if require_reviewed:
             _validate_review_metadata(raw, f"landmark {landmark_id}")
         landmarks.append(dict(raw))
-    return AnnotationManifest(1, reviewed, source_sha256, width, height, frame_count, (numerator, denominator), shots, tuple(annotations), tuple(landmarks))
+    raw_frame_labels = value.get("frame_labels", [])
+    if not isinstance(raw_frame_labels, list):
+        raise AnnotationError("frame_labels must be a list")
+    seen_frame_labels: set[tuple[str, int]] = set()
+    frame_labels: list[dict[str, Any]] = []
+    for raw in raw_frame_labels:
+        if not isinstance(raw, dict):
+            raise AnnotationError("each frame label must be an object")
+        shot_id = str(raw.get("shot_id", ""))
+        shot = shots.get(shot_id)
+        if shot is None:
+            raise AnnotationError("frame label names an unknown shot")
+        try:
+            frame_index = int(raw["source_frame"])
+            pts = int(raw["pts"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise AnnotationError("frame label needs source_frame and pts") from error
+        if not shot.contains(frame_index) or pts < 0:
+            raise AnnotationError("frame label lies outside its shot or has invalid pts")
+        key = (shot_id, frame_index)
+        if key in seen_frame_labels:
+            raise AnnotationError(f"duplicate frame label {shot_id}:{frame_index}")
+        seen_frame_labels.add(key)
+        if require_reviewed and raw.get("review_status") not in {"reviewed", "accepted"}:
+            raise AnnotationError(f"frame label {shot_id}:{frame_index} is not reviewed")
+        if require_reviewed:
+            _validate_review_metadata(raw, f"frame label {shot_id}:{frame_index}")
+        frame_labels.append(dict(raw))
+    return AnnotationManifest(1, reviewed, source_sha256, width, height, frame_count, (numerator, denominator), shots, tuple(annotations), tuple(landmarks), tuple(frame_labels))
 
 
 def source_bbox_from_crop(
@@ -274,4 +303,73 @@ def manifest_template_from_review_pack(pack: Mapping[str, Any], shots: Mapping[s
     for previous, current in zip(ordered, ordered[1:]):
         if current[1]["start_frame"] < previous[1]["end_frame"]:
             raise AnnotationError(f"shot template ranges overlap: {previous[0]} and {current[0]}")
-    return {"schema_version": 1, "reviewed": False, "source": dict(source), "shots": normalized_shots, "annotations": [], "landmarks": [], "review_frames": list(pack.get("frames", [])), "review_policy": "Fill and review all labels, then set reviewed=true."}
+    return {"schema_version": 1, "reviewed": False, "source": dict(source), "shots": normalized_shots, "annotations": [], "landmarks": [], "frame_labels": [], "review_frames": list(pack.get("frames", [])), "review_policy": "Fill and review all labels, then set reviewed=true."}
+
+
+def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
+    """Convert a reviewed annotation manifest into the evaluator reference contract.
+
+    Player annotations use ``track_id`` (falling back to ``id``) as the
+    sequence-local object ID. Optional ``global_id``/``cross_shot_id`` fields
+    become the reviewed cross-shot map. This conversion never invents empty
+    frames or identities: only explicitly reviewed annotation records enter the
+    reference artifact.
+    """
+
+    if not manifest.reviewed:
+        raise AnnotationError("cannot build an evaluator reference from an unreviewed manifest")
+    grouped: dict[str, dict[int, list[dict[str, Any]]]] = {shot_id: {} for shot_id in manifest.shots}
+    frame_records: dict[tuple[str, int], dict[str, Any]] = {}
+    for raw in manifest.frame_labels:
+        key = (str(raw["shot_id"]), int(raw["source_frame"]))
+        frame_records[key] = {"labeled": bool(raw.get("labeled", True)), "ignore": bool(raw.get("ignore", False)), "pts": int(raw["pts"])}
+    cross_shot_identity: dict[str, dict[str, str]] = {}
+    frame_pts: dict[tuple[str, int], int] = {}
+    seen_objects: set[tuple[str, int, str]] = set()
+    for raw in manifest.annotations:
+        shot_id = str(raw["shot_id"])
+        frame_index = int(raw["source_frame"])
+        pts = int(raw["pts"])
+        frame_key = (shot_id, frame_index)
+        if frame_key in frame_pts and frame_pts[frame_key] != pts:
+            raise AnnotationError(f"reviewed frame {shot_id}:{frame_index} has conflicting PTS values")
+        frame_pts[frame_key] = pts
+        object_id = str(raw.get("track_id") or raw.get("id") or "").strip()
+        if not object_id:
+            raise AnnotationError(f"annotation {raw.get('id', '<unknown>')} needs track_id or id")
+        key = (shot_id, frame_index, object_id)
+        if key in seen_objects:
+            raise AnnotationError(f"duplicate reviewed object {shot_id}:{frame_index}:{object_id}")
+        seen_objects.add(key)
+        if "bbox_xyxy_px" not in raw:
+            continue
+        object_value: dict[str, Any] = {"id": object_id, "bbox_xyxy": list(_box(raw["bbox_xyxy_px"]))}
+        if raw.get("team") is not None:
+            object_value["team"] = str(raw["team"])
+        contact = raw.get("ground_contact_xy_yards")
+        if contact is not None:
+            try:
+                object_value["ground_contact_xy_yards"] = list(validate_field_point(tuple(float(item) for item in contact)))
+            except (TypeError, ValueError) as error:
+                raise AnnotationError(f"annotation {raw.get('id', '<unknown>')} has invalid ground contact") from error
+            if raw.get("ground_contact_confidence") is not None:
+                try:
+                    object_value["ground_contact_confidence"] = float(raw["ground_contact_confidence"])
+                except (TypeError, ValueError) as error:
+                    raise AnnotationError(f"annotation {raw.get('id', '<unknown>')} has invalid ground contact confidence") from error
+        grouped.setdefault(shot_id, {}).setdefault(frame_index, []).append(object_value)
+        global_id = raw.get("global_id", raw.get("cross_shot_id"))
+        if global_id is not None and str(global_id).strip().lower() not in {"", "unknown", "ambiguous", "unresolved"}:
+            normalized_global_id = str(global_id)
+            previous_global_id = cross_shot_identity.setdefault(shot_id, {}).get(object_id)
+            if previous_global_id is not None and previous_global_id != normalized_global_id:
+                raise AnnotationError(f"reviewed object {shot_id}:{object_id} has conflicting global identities")
+            cross_shot_identity[shot_id][object_id] = normalized_global_id
+    sequences: dict[str, dict[str, Any]] = {}
+    for shot_id, frames in sorted(grouped.items()):
+        frame_indices = sorted(set(frames) | {frame_index for frame_shot, frame_index in frame_records if frame_shot == shot_id})
+        sequences[shot_id] = {"frames": {str(frame_index): {**frame_records.get((shot_id, frame_index), {"labeled": True, "ignore": False, "pts": frame_pts.get((shot_id, frame_index))}), "objects": objects} for frame_index, objects in ((frame_index, frames.get(frame_index, [])) for frame_index in frame_indices)}}
+    reference: dict[str, Any] = {"schema_version": 1, "reviewed": True, "source_sha256": manifest.source_sha256, "sequences": sequences}
+    if cross_shot_identity:
+        reference["cross_shot_identity"] = cross_shot_identity
+    return reference

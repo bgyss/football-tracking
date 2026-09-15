@@ -62,6 +62,8 @@ def validate_run_artifacts(directory: str | Path) -> dict[str, Any]:
             errors.append("unable to count observations.csv")
     identity_links = values.get("identity-links.json", {})
     identities = values.get("identities.json", {})
+    if identity_links.get("schema_version") != 2:
+        errors.append("identity-links schema_version is not 2")
     if identity_links.get("tracklet_count") != len(identities):
         errors.append("identity-links tracklet_count does not match identities.json")
     if identity_links.get("player_id_count") != len(set(identities.values())):
@@ -73,4 +75,7 @@ def validate_run_artifacts(directory: str | Path) -> dict[str, Any]:
     calibration = values.get("calibration.json", {})
     if source_hash and calibration.get("source_sha256") not in {None, source_hash}:
         errors.append("calibration source_sha256 does not match manifest input_sha256")
+    calibration_quality = values.get("calibration-quality.json", {})
+    if calibration_quality.get("schema_version") != 1:
+        errors.append("calibration-quality schema_version is not 1")
     return {"schema_version": 1, "status": "valid" if not errors else "invalid", "directory": str(root), "checked_artifacts": [filename for filename in REQUIRED_ARTIFACTS if (root / filename).is_file()], "errors": errors}

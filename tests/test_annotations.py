@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from football_tracking.annotations import AnnotationError, load_annotation_manifest, manifest_template_from_review_pack, source_bbox_from_crop
+from football_tracking.annotations import AnnotationError, load_annotation_manifest, manifest_template_from_review_pack, mot_reference_from_manifest, source_bbox_from_crop
 
 
 def source() -> dict:
@@ -79,3 +79,35 @@ def test_manifest_template_preserves_review_pack_source_and_frame_records() -> N
     assert template["reviewed"] is False
     assert template["source"]["sha256"] == "abc"
     assert template["review_frames"][0]["pts"] == 120
+
+
+def test_reviewed_manifest_converts_to_mot_reference_and_cross_shot_map(tmp_path) -> None:
+    value = manifest(
+        annotations=[
+            {**manifest()["annotations"][0], "track_id": "p1", "global_id": "PLAYER-A", "team": "DET", "ground_contact_xy_yards": [20, 2]},
+            {**manifest()["annotations"][0], "id": "b", "track_id": "q1", "shot_id": "shot-0", "source_frame": 3, "pts": 180, "global_id": "PLAYER-A", "bbox_xyxy_px": [20, 2, 30, 20], "team": "DET"},
+        ],
+    )
+    parsed = load_annotation_manifest(write(tmp_path, value), "abc")
+    reference = mot_reference_from_manifest(parsed)
+    assert reference["reviewed"] is True
+    assert reference["sequences"]["shot-0"]["frames"]["2"]["objects"][0]["id"] == "p1"
+    assert reference["cross_shot_identity"]["shot-0"]["p1"] == "PLAYER-A"
+
+
+def test_reviewed_frame_labels_preserve_empty_and_ignored_frames(tmp_path) -> None:
+    base_annotation = manifest()["annotations"][0]
+    frame_meta = {"shot_id": "shot-0", "source_frame": 1, "pts": 60, "labeled": True, "ignore": False, "review_status": "reviewed", "reviewer": "reviewer-1", "revision": 1, "reviewed_at": "2026-09-15T00:00:00Z", "annotation_confidence": 1.0}
+    ignored_meta = {**frame_meta, "source_frame": 4, "pts": 240, "ignore": True}
+    value = manifest(annotations=[base_annotation], frame_labels=[frame_meta, ignored_meta])
+    parsed = load_annotation_manifest(write(tmp_path, value), "abc")
+    reference = mot_reference_from_manifest(parsed)
+    assert reference["sequences"]["shot-0"]["frames"]["1"]["objects"] == []
+    assert reference["sequences"]["shot-0"]["frames"]["4"]["ignore"] is True
+
+
+def test_unreviewed_manifest_cannot_become_evaluator_reference(tmp_path) -> None:
+    value = manifest(reviewed=False)
+    parsed = load_annotation_manifest(write(tmp_path, value), "abc", require_reviewed=False)
+    with pytest.raises(AnnotationError, match="unreviewed"):
+        mot_reference_from_manifest(parsed)

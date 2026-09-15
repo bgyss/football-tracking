@@ -60,12 +60,25 @@ x=10 and x=110 and hash rows at y=70.75/3 and y=53 1/3−70.75/3. Use semantic I
 `yardline:20:hash:near` and `goal_line:west:sideline:near`; repeated markings require
 the side and field orientation so a mirrored fit cannot pass by appearance alone.
 
+Calibration exports retain the RANSAC fit inlier/outlier indices. A caller can also ask for
+local projection sensitivity in yards per declared pixel uncertainty; this is diagnostic
+until the contact-quality policy is frozen and reviewed on player labels.
+
 Keep these labels separate:
 
 - fitting landmarks and withheld landmarks for calibration;
 - visible-player boxes and contact-point confidence for position evaluation;
 - within-shot track identity and cross-shot global identity;
 - snap/corresponding events for play-time alignment.
+
+Use `frame_labels` for reviewed empty or ignored frames. An empty `objects` list with
+`labeled: true` means the reviewer inspected the frame and found no evaluable objects;
+`ignore: true` excludes that frame under the declared evaluation policy. Omitting a frame
+does not silently turn it into negative ground truth.
+
+Player records may include `ground_contact_xy_yards` and an explicit
+`ground_contact_confidence`. Contacts below the frozen evaluator confidence threshold are
+reported as excluded rather than counted as position failures.
 
 The review pack produced by `scripts/build_identity_review_pack.py` is intentionally
 `reviewed: false`. Reviewers must confirm source frame, PTS, shot interval, play grouping,
@@ -84,6 +97,9 @@ inter-frame transform when supplied a static-field mask. The transform is compos
 `H_current = H_keyframe @ inverse(G_current_from_keyframe)` and is discarded when fewer
 than four robust correspondences remain. This motion estimate is a propagation proposal;
 absolute reviewed landmarks and withheld validation remain the authority for identity.
+`propagate_calibration_timeline` applies reviewed motion steps only within a declared PTS
+gap and ends support when that gap is exceeded; it never extrapolates through an unsupported
+camera move.
 
 Once the manifest contains reviewed landmark records, call
 `timeline_from_landmark_records(manifest.landmarks)` to fit the schema-v2 timeline. Each

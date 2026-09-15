@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from football_tracking.calibration_timeline import CalibrationTimelineError, estimate_field_motion, load_calibration_timeline, propagate_homography, static_field_mask, timeline_from_landmark_records
+from football_tracking.calibration_timeline import CalibrationTimelineError, estimate_field_motion, load_calibration_timeline, propagate_calibration_timeline, propagate_homography, static_field_mask, timeline_from_landmark_records
 from football_tracking.calibration import FieldPoint, Homography, ImagePoint, project_observation
 from football_tracking.schema import Observation
 
@@ -112,6 +112,30 @@ def test_propagation_composes_current_to_keyframe_direction() -> None:
     motion = np.asarray([[1, 0, 10], [0, 1, 0], [0, 0, 1]], dtype=float)
     propagated = propagate_homography(h, motion)
     assert propagated.project(ImagePoint(10, 0)) == FieldPoint(0.0, 0.0)
+
+
+def test_timeline_motion_propagation_stops_after_a_large_gap() -> None:
+    h = Homography.fit(
+        [ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)],
+        [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)],
+        withheld_image_points=[ImagePoint(50, 50)],
+        withheld_field_points=[FieldPoint(5, 5)],
+    )
+    from football_tracking.calibration_timeline import CalibrationEstimate, CalibrationTimeline
+
+    estimate = CalibrationEstimate("shot-0", "key", h, 0, None, ("key",), "valid", support_polygon_px=((0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)))
+    timeline = CalibrationTimeline({"shot-0": [estimate]})
+    propagated = propagate_calibration_timeline(
+        timeline,
+        {"shot-0": [(10, ((1, 0, 1), (0, 1, 0), (0, 0, 1))), (30, ((1, 0, 1), (0, 1, 0), (0, 0, 1)))]},
+        max_gap_pts=12,
+    )
+    assert propagated.at("shot-0", 5) is not None
+    assert propagated.at("shot-0", 10) is not None
+    assert propagated.at("shot-0", 21) is not None
+    assert propagated.at("shot-0", 22) is None
+    assert propagated.at("shot-0", 30) is None
+    assert propagated.at("shot-0", 10).support_polygon_px[0] == (1.0, 0.0)
 
 
 def test_estimate_field_motion_returns_none_without_spatial_support() -> None:

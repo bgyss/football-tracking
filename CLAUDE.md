@@ -72,13 +72,17 @@ export → evaluate → manifest.
   independent yard residuals; without `--calibration` the yard columns stay empty and only
   image-space positions are exported.
 - `calibration_timeline.py` — reviewed PTS-scoped fits, withheld-landmark eligibility, and
-  field-only motion propagation proposals.
+  bounded field-only motion propagation proposals.
 - `annotations.py` / `field.py` — source-hashed reviewed annotation manifests and the
   canonical NFL field coordinate template.
 - `scripts/fit_calibration_timeline.py` — convert a reviewed annotation manifest into the
   schema-v2 PTS-scoped calibration artifact.
 - `scripts/build_annotation_manifest.py` — create an unreviewed manifest template from the
   extracted full-game review pack.
+- `scripts/build_reviewed_reference.py` — convert a reviewed annotation manifest into the
+  strict MOT/reference and cross-shot identity artifact consumed by evaluation.
+- `scripts/check_identity_readiness.py` — audit source-hashed calibration, timing, and
+  reviewed-reference prerequisites before attempting promotion.
 - `scripts/build_play_inventory.py` — scan long recordings into unreviewed candidate shot
   intervals for play grouping and calibration review.
 - `evaluation.py` — reviewed MOT-style reference import and HOTA/IDF1-style metrics.

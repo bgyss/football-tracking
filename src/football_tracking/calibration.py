@@ -52,6 +52,8 @@ class Homography:
     status: str = "unvalidated"
     reason: str | None = None
     withheld_errors_yards: tuple[float, ...] = ()
+    inlier_indices: tuple[int, ...] = ()
+    outlier_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         matrix = np.asarray(self.matrix, dtype=float)
@@ -70,6 +72,13 @@ class Homography:
             raise ValueError("withheld homography error count is invalid")
         if any(not np.isfinite(value) or value < 0 for value in self.withheld_errors_yards):
             raise ValueError("withheld homography errors must be finite and non-negative")
+        all_indices = set(self.inlier_indices) | set(self.outlier_indices)
+        if any(not isinstance(index, int) or index < 0 or index >= self.point_count for index in all_indices):
+            raise ValueError("homography inlier indices are invalid")
+        if set(self.inlier_indices) & set(self.outlier_indices) or len(set(self.inlier_indices)) != len(self.inlier_indices) or len(set(self.outlier_indices)) != len(self.outlier_indices):
+            raise ValueError("homography inlier and outlier indices must be disjoint")
+        if self.inlier_indices and len(self.inlier_indices) != self.inlier_count:
+            raise ValueError("homography inlier index count does not match inlier_count")
         for value in (self.withheld_median_error_yards, self.withheld_p95_error_yards):
             if value is not None and (not np.isfinite(value) or value < 0):
                 raise ValueError("withheld homography errors must be finite and non-negative")
@@ -120,6 +129,8 @@ class Homography:
         canonical = np.asarray(matrix / matrix[2, 2], dtype=np.float64)
         digest = hashlib.sha256(canonical.tobytes()).hexdigest()[:16]
         matrix_tuple = tuple(tuple(float(value) for value in row) for row in canonical)
+        inlier_indices = tuple(int(index) for index, value in enumerate(mask.reshape(-1)) if value)
+        outlier_indices = tuple(int(index) for index, value in enumerate(mask.reshape(-1)) if not value)
         withheld_median: float | None = None
         withheld_p95: float | None = None
         withheld_count = 0
@@ -165,6 +176,8 @@ class Homography:
             status,
             reason,
             withheld_errors_values,
+            inlier_indices,
+            outlier_indices,
         )
 
     @property
@@ -205,6 +218,21 @@ class Homography:
         # round-trip deterministically in JSON and fixture comparisons.
         return FieldPoint(float(round(float(projected[0]), 12)), float(round(float(projected[1]), 12)))
 
+    def local_projection_sensitivity(self, image_point: ImagePoint, *, pixel_radius: float = 1.0) -> float | None:
+        """Estimate yard displacement from a small image-coordinate perturbation."""
+
+        if not np.isfinite(pixel_radius) or pixel_radius <= 0:
+            raise ValueError("pixel_radius must be positive and finite")
+        base = self.project(image_point)
+        if base is None:
+            return None
+        values: list[float] = []
+        for dx, dy in ((pixel_radius, 0.0), (-pixel_radius, 0.0), (0.0, pixel_radius), (0.0, -pixel_radius)):
+            neighbor = self.project(ImagePoint(image_point.x_px + dx, image_point.y_px + dy))
+            if neighbor is not None:
+                values.append(float(np.hypot(neighbor.x_yards - base.x_yards, neighbor.y_yards - base.y_yards)))
+        return max(values, default=0.0)
+
 
 def project_observation(
     observation: Observation,
@@ -214,6 +242,7 @@ def project_observation(
     calibration_status: str | None = None,
     calibration_reason: str | None = None,
     support_polygon_px: Sequence[tuple[float, float]] | None = None,
+    pixel_uncertainty_px: float | None = None,
 ) -> Observation:
     if source != "bottom_center":
         raise ValueError("only bottom_center projection is currently supported")
@@ -239,6 +268,11 @@ def project_observation(
             calibration_status=calibration_status or homography.status,
             calibration_reason=calibration_reason or homography.reason or "projection_invalid",
         )
+    position_uncertainty = homography.withheld_p95_error_yards if homography.identity_eligible else None
+    if pixel_uncertainty_px is not None:
+        sensitivity = homography.local_projection_sensitivity(ImagePoint((x1 + x2) / 2.0, y2), pixel_radius=pixel_uncertainty_px)
+        if sensitivity is not None:
+            position_uncertainty = max(position_uncertainty or 0.0, sensitivity)
     return replace(
         observation,
         field_xy_yards=(projected.x_yards, projected.y_yards),
@@ -246,7 +280,7 @@ def project_observation(
         calibration_id=homography.calibration_id,
         calibration_status=calibration_status or homography.status,
         calibration_reason=calibration_reason or homography.reason,
-        position_uncertainty_yards=homography.withheld_p95_error_yards if homography.identity_eligible else None,
+        position_uncertainty_yards=position_uncertainty,
     )
 
 
@@ -288,6 +322,8 @@ def load_calibrations(path: str | Path, *, source_sha256: str | None = None) -> 
                     str(config.get("status", "unvalidated")),
                     config.get("reason") if isinstance(config.get("reason"), str) else None,
                     tuple(float(item) for item in config.get("withheld_errors_yards", ())),
+                    tuple(int(item) for item in config.get("inlier_indices", ())),
+                    tuple(int(item) for item in config.get("outlier_indices", ())),
                 )
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError("invalid serialized homography") from error
@@ -317,7 +353,7 @@ def calibration_quality_report(calibrations: Mapping[str, Homography]) -> dict[s
     """Summarize withheld calibration quality without treating fit error as validation."""
 
     if not calibrations:
-        return {"status": "not_provided", "shots": {}}
+        return {"schema_version": 1, "status": "not_provided", "shots": {}}
     per_shot: dict[str, dict[str, object]] = {}
     all_errors: list[float] = []
     for shot_id, homography in sorted(calibrations.items()):
@@ -331,13 +367,15 @@ def calibration_quality_report(calibrations: Mapping[str, Homography]) -> dict[s
             "median_error_yards": homography.withheld_median_error_yards,
             "p95_error_yards": homography.withheld_p95_error_yards,
             "fit_error_px": homography.fit_error_px,
+            "inlier_indices": homography.inlier_indices,
+            "outlier_indices": homography.outlier_indices,
             "calibration_id": homography.calibration_id,
             "reason": homography.reason,
         }
     if not all_errors:
         status = "invalid" if any(item["status"] == "invalid" for item in per_shot.values()) else "unvalidated"
-        return {"status": status, "shots": per_shot, "reason": "no withheld landmark errors"}
+        return {"schema_version": 1, "status": status, "shots": per_shot, "reason": "no withheld landmark errors"}
     median = float(np.median(np.asarray(all_errors, dtype=float)))
     p95 = float(np.percentile(np.asarray(all_errors, dtype=float), 95))
     valid = all(calibration.status == "valid" and calibration.identity_eligible for calibration in calibrations.values()) and median <= 1.0 and p95 <= 2.0
-    return {"status": "valid" if valid else "invalid", "shots": per_shot, "withheld_point_count": len(all_errors), "median_error_yards": median, "p95_error_yards": p95, "gate": {"median_at_most_1_yard": median <= 1.0, "p95_at_most_2_yards": p95 <= 2.0}}
+    return {"schema_version": 1, "status": "valid" if valid else "invalid", "shots": per_shot, "withheld_point_count": len(all_errors), "median_error_yards": median, "p95_error_yards": p95, "gate": {"median_at_most_1_yard": median <= 1.0, "p95_at_most_2_yards": p95 <= 2.0}}
