@@ -63,6 +63,34 @@ The class-mapping file is a non-empty JSON object, for example
 `{"1": "person"}` for the generic checkpoint, and is compared exactly with
 the cache provenance before replay.
 
+## Cross-shot replay identity
+
+Without `--play-alignment`, every run — including the default RF-DETR/BoT-SORT
+path — assigns each shot-local tracklet its own anonymous `player_id` and
+writes `identity-links.json` with `status: not_attempted`. No tracklets are
+joined across the frame-712 cut. To attempt a constrained cross-shot join,
+supply a reviewed play-time alignment, shot-specific calibration, and a
+reviewed reference:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
+  --input data/all-22-lions-rams-sample.mp4 \
+  --output artifacts/cross-shot \
+  --detector rfdetr --detector-checkpoint /path/to/football-rfdetr.pth \
+  --tracker botsort --manual-cut 712 \
+  --calibration /path/to/shot-landmarks.json \
+  --play-alignment /path/to/reviewed-snap-anchors.json \
+  --reviewed-reference /path/to/reviewed-mot-reference.json
+```
+
+Without `--calibration` supplying valid field positions for both aligned
+shots, the resolver abstains by design and `identity-links.json` records
+`status: abstained` with no merges. `tracking-evaluation.json` reports
+`cross_shot.status: not_evaluated` unless the reviewed reference carries a
+`cross_shot_identity` map. See
+[docs/evidence/cross-shot-identity.md](docs/evidence/cross-shot-identity.md)
+for the measured state of this milestone on the current assets.
+
 ## Memory guard
 
 Every run has a 2048 MiB host-process peak-RSS budget by default. It samples

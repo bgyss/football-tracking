@@ -94,7 +94,7 @@ The sample changes camera perspective at frame 712 (approximately 11.88 seconds)
 - `play_id` identifies the underlying football play;
 - `player_id` identifies an anonymous player across compatible tracklets.
 
-The current CLI calls `stable_anonymous_ids(tracklet_ids, [])`, so each tracklet receives a deterministic ID but no tracklets are joined across shots. `review.json` records this as unresolved. This is deliberate: image-coordinate proximity across the cut is meaningless.
+When `--play-alignment` is supplied, the CLI now builds candidate cross-shot links from `replay.cross_shot_candidate_scores` over calibrated field positions and passes them through `identity.match_tracklets` before calling `stable_anonymous_ids`; every decision — resolved, abstained, or not attempted — is recorded in `identity-links.json`. Without `--play-alignment`, or without calibrated field positions for at least two aligned shots, the resolver abstains and `stable_anonymous_ids` still receives an empty link list, so each tracklet keeps its own deterministic, shot-local ID and no tracklets are joined across shots. `review.json` records this as unresolved. Abstention on uncalibrated footage is deliberate: image-coordinate proximity across the cut is meaningless. See [docs/evidence/cross-shot-identity.md](evidence/cross-shot-identity.md) for the measured status on the current assets — cross-shot identity has not been demonstrated to resolve correctly on real footage; only the plumbing has been exercised.
 
 Implement replay matching in a new module or as a deeper layer above `identity.py`:
 
