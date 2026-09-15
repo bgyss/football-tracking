@@ -100,7 +100,13 @@ def _paired_samples(
     right: FieldTrack,
     tolerance_s: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Pair samples that share a play time within tolerance, nearest match wins."""
+    """Pair samples that share a play time within tolerance.
+
+    Each right-hand sample is consumable at most once. Left samples are walked
+    in order, and the nearest unmatched right sample within tolerance is claimed.
+    This ensures a one-to-one correspondence in case of occlusion gaps or
+    differently-sampled tracklets.
+    """
 
     if not left.samples or not right.samples:
         return np.empty((0, 2)), np.empty((0, 2))
@@ -108,10 +114,15 @@ def _paired_samples(
     right_points = np.asarray([(sample[1], sample[2]) for sample in right.samples], dtype=float)
     left_pairs: list[tuple[float, float]] = []
     right_pairs: list[tuple[float, float]] = []
+    used: set[int] = set()
     for time_s, x, y in left.samples:
         offsets = np.abs(right_times - time_s)
+        if used:
+            offsets = offsets.copy()
+            offsets[list(used)] = np.inf
         index = int(np.argmin(offsets))
         if offsets[index] <= tolerance_s:
+            used.add(index)
             left_pairs.append((x, y))
             right_pairs.append(tuple(right_points[index]))
     return np.asarray(left_pairs, dtype=float), np.asarray(right_pairs, dtype=float)

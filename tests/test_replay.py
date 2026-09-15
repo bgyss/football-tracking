@@ -176,3 +176,19 @@ def test_scores_are_bounded_and_deterministic() -> None:
 
     assert first == second
     assert all(0.0 <= value <= 1.0 for value in first.values())
+
+
+def test_paired_samples_enforces_exclusivity_of_right_matches() -> None:
+    # Left track: ten samples clustered around time 0.0 (start=0.0, step=0.1).
+    # Right track: one sample at time 0.0.
+    # Without exclusivity, all ten left samples could match the single right sample,
+    # inflating pair count and passing the min_overlap_samples floor.
+    # With exclusivity, only one left sample claims the right sample, yielding
+    # exactly one pair, which fails the min_overlap_samples gate.
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0, count=10, start=0.0, step=0.05)]
+    right = [line("shot-1:t1", "shot-1", 10.0, 20.0, count=1, start=0.0, step=0.1)]
+    evidence = teams(**{"shot-0:t1": "DET", "shot-1:t1": "DET"})
+
+    # With default min_overlap_samples=5, a single pair should fail the gate.
+    scores = cross_shot_candidate_scores(left, right, evidence)
+    assert ("shot-0:t1", "shot-1:t1") not in scores
