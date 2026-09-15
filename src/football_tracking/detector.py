@@ -19,6 +19,8 @@ class Detection:
 
     def __post_init__(self) -> None:
         x1, y1, x2, y2 = self.box_xyxy
+        if any(not np.isfinite(float(value)) for value in self.box_xyxy):
+            raise ValueError("box coordinates must be finite")
         if x2 <= x1 or y2 <= y1:
             raise ValueError("box must have positive width and height")
         if not 0.0 <= self.score <= 1.0:

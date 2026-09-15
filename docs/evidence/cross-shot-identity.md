@@ -103,16 +103,15 @@ A cross-shot identity evaluator reporting precision and coverage separately
 (`evaluation.py`), an `identity-links.json` evidence file written by every run
 (regardless of whether cross-shot resolution was attempted), a reviewed play-time
 alignment loader and a cross-shot candidate scorer (`replay.py`), and CLI wiring behind
-`--play-alignment` that abstains without calibrated field positions. See
-`.superpowers/sdd/progress.md` for the task-by-task record and the decisions made while
-building it (including the injective-pairing fix and the documented limitation that only
-the first two aligned shots are resolved, with the rest recorded in
-`identity-links.json`'s `unresolved_shots`).
+`--play-alignment` that abstains without calibrated field positions. The current resolver
+evaluates every eligible aligned shot pair and records skipped views, rejected links, and
+unmatched segments in `identity-links.json`; it does not claim a real-footage result until
+the reviewed calibration, timing, and identity labels exist.
 
 None of this has been exercised end-to-end on the real clip: doing so requires a reviewed
 play-time alignment and shot-specific calibration landmarks, neither of which exists for
-this footage yet (see "Blocked gates" below). `--play-alignment` and `--calibration` were
-exercised only against synthetic fixtures in the test suite, not against
+this footage yet (see "Blocked gates" below). `--play-alignment` and both legacy/v2
+`--calibration` paths were exercised only against synthetic fixtures in the test suite, not against
 `data/all-22-lions-rams-sample.mp4`.
 
 ## The critical caveat: two failure modes remain indistinguishable
@@ -140,12 +139,27 @@ the real clip:
 | --- | --- | --- |
 | Reviewed MOT-style reference with global identity map | Measured baseline, Resolution verified | `evaluate_tracking` refuses unreviewed data by design (`evaluation.py:45`) |
 | Reviewed snap-frame anchors for both shots | Resolution verified | Play-time alignment has no other anchor |
+| Reviewed PTS correspondences plus held-out timing events for both shots | Resolution verified | A snap-only equal-rate offset is explicitly unvalidated for identity |
 | Shot-specific calibration landmarks for both shots | Resolution verified | Field-position agreement is the only view-invariant geometric signal; image coordinates are meaningless across a cut |
 
 Until calibration landmarks exist for both shots, the resolver is expected and required
 to abstain on the sample clip. A measured abstention is a correct outcome for this
 milestone's plumbing state, not a failure or a success — it is what the code is supposed
 to do without its inputs.
+
+The implementation now treats legacy static landmark files as projection-compatible but
+identity-ineligible. Cross-shot resolution requires schema-v2 source-hashed calibration
+with independent withheld-landmark validation.
+
+The positive integration fixture now also supplies two reviewed PTS correspondences per
+shot and held-out timing events; snap-only equal-rate fixtures abstain. This demonstrates
+the prerequisite enforcement and synthetic plumbing, not real-footage identity accuracy.
+
+An optional end-to-end synthetic fixture now supplies reviewed MOT boxes, cross-shot truth,
+validated calibration/timing, and ground-contact points. With TrackEval installed, its
+component checks pass but `promotion_gate` remains `not_evaluated` because proxy detections
+cannot be promoted. This is a wiring and regression proof; synthetic geometry remains
+excluded from real-game accuracy claims.
 
 ## What this document does not claim
 
@@ -291,7 +305,36 @@ It remains a single-game asset, so cross-game generalization requires additional
 The ignored directory `artifacts/full-game-calibration-review-pack/` was generated from
 the full-game source with the review-pack script at 12 scouting frame indices. It contains
 original-resolution JPEGs plus `review-pack.json` with source hash, dimensions, frame
-indices, and PTS values marked `constant_rate_derivation`. The pack is a calibration and
+indices, exact source-index PTS values, and unreviewed Hough field-line segment proposals.
+The pack is a calibration and
 identity annotation starting point; it is not reviewed truth and cannot be passed to the
 evaluation loader until shot intervals, landmarks, timing events, and player labels are
 reviewed.
+
+Runs also write `calibration-quality.json`, which reports whether fitting and withheld
+landmark errors are `unvalidated`, `valid`, or `invalid` per shot/interval. This report is
+separate from `calibration.json`'s matrices and from player-contact position error.
+
+When validated play timing and identity are available, `play-trajectories.csv` collapses
+same-player replay observations into one play-time bin and records the chosen source shot,
+frame, PTS, calibration ID, and uncertainty. Per-shot `trajectories.csv` remains available
+for auditing the original views.
+
+`tracking-evaluation.json` now includes `promotion_gate`; it remains `not_evaluated` when
+TrackEval, validated calibration, or reviewed cross-shot truth is missing.
+If reviewed objects include `ground_contact_xy_yards`, it also reports a separate
+`ground_contact` error/coverage gate; landmark fit error is never used as a substitute for
+player-contact accuracy.
+
+Each run also writes `analysis-config.json`, which freezes the input/window, model/cache,
+calibration/timing, resolver, and split policies while keeping evaluation-reference
+provenance separate.
+`artifact-validation.json` then verifies that hashes, identity counts, and promotion-gate
+copies agree across the exported files.
+Windowed evaluation reports carry `evaluation_window` and never score predictions against
+reference frames outside the processed source range.
+
+Schema-v2 calibration source-hash mismatches and malformed reviewed split overlays are
+validated before detector/tracker execution, so those failures do not leave a partial
+detection cache that could be mistaken for a complete run.
+Reviewed MOT references are now checked the same way when supplied to a run.

@@ -80,7 +80,7 @@ For each shot, label at least 6–8 well-distributed intersections of yard lines
 
 The coordinates above are illustrative; they must be replaced with landmarks measured in the actual frames. Run with `--calibration data/calibration.json`. The current sample has no calibration file, which is why `trajectories.csv` contains image-space contact points while its yard columns are empty and `field-view.png` contains only the field grid.
 
-A static homography per shot is sufficient for a fixed camera. All-22 footage often pans and zooms, so the next calibration module should store time-keyed homographies. Refit from field features at keyframes, interpolate only between valid fits, and invalidate positions when reprojection error rises. Camera-motion compensation used by BoT-SORT and metric field calibration solve different problems and need separate quality checks.
+A static homography per shot is sufficient for a fixed camera. All-22 footage often pans and zooms, so `calibration_timeline.py` stores reviewed PTS-scoped homographies and a deterministic field-only motion-propagation proposal. Refit from field features at keyframes, stop at unsupported gaps, and invalidate positions when withheld reprojection error or support falls below policy. Camera-motion compensation used by BoT-SORT and metric field calibration solve different problems and need separate quality checks.
 
 Bottom-center box contact is approximate for crouching, airborne, tackled, or truncated players. Add pose or segmentation foot points when the withheld ground-contact error shows that this dominates. Keep observed, predicted, interpolated, and invalid positions distinct; never fill a long occlusion as measured movement.
 
@@ -96,11 +96,11 @@ The sample changes camera perspective at frame 712 (approximately 11.88 seconds)
 
 When `--play-alignment` is supplied, the CLI builds candidate links from `replay.cross_shot_candidate_scores` over calibrated field positions, resolves every aligned shot pair through `identity.match_tracklets` and component checks, then calls `stable_anonymous_ids`; every candidate and decision — resolved, partial, abstained, or not attempted — is recorded in `identity-links.json`. A schema-v2 timeline must have independently withheld-validated positions for at least two aligned shots; otherwise the resolver abstains and `stable_anonymous_ids` receives an empty link list. Legacy static landmarks remain a compatibility input and are labeled `unvalidated` in `calibration.json`; they should be replaced by reviewed v2 fits before promoting identity results. Without `--play-alignment`, each tracklet keeps its own deterministic shot-local ID. Abstention on uncalibrated footage is deliberate: image-coordinate proximity across the cut is meaningless. See [docs/evidence/cross-shot-identity.md](evidence/cross-shot-identity.md) for the measured status on the current assets — cross-shot identity has not been demonstrated to resolve correctly on real footage; only the plumbing has been exercised.
 
-Implement replay matching in a new module or as a deeper layer above `identity.py`:
+The implemented replay resolver in `identity_resolution.py` follows this sequence:
 
 1. Annotate snap/action anchors and assign a common `play_time_s` to each shot. Keep media timestamps unchanged.
 2. Confirm the second view is a replay using formation, field markings, and action timing. Do not append the replay to the first trajectory.
-3. Build a candidate score from team agreement, calibrated field positions at aligned times, trajectory shape, jersey-number consensus, and football-specific appearance embeddings.
+3. Build a candidate score from team agreement, calibrated field positions at aligned times, trajectory shape, local calibration/contact uncertainty, jersey-number consensus, and football-specific appearance embeddings.
 4. Pass candidate scores into the existing `match_tracklets` function. It already supports one-to-one assignment, score thresholds, and abstention margins.
 5. Pass accepted `IdentityLink` records into `stable_anonymous_ids`. Preserve rejected and insufficient-evidence links with their supporting crop or frame IDs.
 6. Reject team conflicts, impossible field motion, duplicate simultaneous identities, and weak margins. Keep unresolved tracklets separate.

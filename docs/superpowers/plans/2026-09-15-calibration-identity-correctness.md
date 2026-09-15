@@ -234,6 +234,11 @@ assert all(link.decision == "insufficient_evidence" for link in links)
 
 ## Execution readiness and stop conditions
 
+The task checkboxes below include the real reviewed-footage and sealed-evaluation gates;
+they are not marked complete by synthetic fixtures. The implementation-status record that
+follows identifies the safety, schema, and bounded-run work already present in this
+worktree, while the remaining boxes stay open until their evidence exists.
+
 ## Implementation status (2026-09-15)
 
 The current worktree implements the first safety and data-contract slice:
@@ -242,6 +247,46 @@ The current worktree implements the first safety and data-contract slice:
 - identity assignment has explicit unmatched choices, global ambiguity margins, component conflict rejection, conservative team evidence, reviewed split overlays, and an all-aligned-view play resolver;
 - evaluation keeps the reviewed shared-player denominator independent of detections, reports mixed/unattributed/component cases, and exposes standard TrackEval metrics separately from diagnostics;
 - versioned annotation/field contracts and an ignored full-game review-pack generator are available.
+- reviewed landmark records can be converted directly with `timeline_from_landmark_records` or `scripts/fit_calibration_timeline.py`; missing PTS or withheld points are rejected.
+- `calibration-quality.json` separates fit/withheld geometry status from player-contact error.
+- the CLI now prevents legacy static homographies from creating cross-shot merges; positive resolution requires schema-v2, source-hashed, withheld-validated calibration.
+- one-anchor timing is now exportable for compatibility but cannot create a cross-shot merge; positive resolution requires held-out PTS timing validation.
+- cross-shot candidates carry aligned calibration/contact uncertainty; high-uncertainty pairs are rejected before assignment.
+- only observations inside a currently valid timeline interval can enter cross-shot matching; neighboring unvalidated intervals are excluded.
+- `evaluate_promotion_gates` now keeps the final acceptance state `not_evaluated` or `failed` until standard tracking, calibration, and cross-shot evidence all satisfy frozen thresholds.
+- cross-shot reports now keep reviewed-player and tracklet-pair denominators separately.
+- promotion now enforces the IDF1 threshold per shot as well as on the combined sequence.
+- proxy detector runs remain `not_evaluated` even when synthetic labels make every component check pass.
+- reviewed reference attribution now uses explicit-dummy Hungarian assignment per frame, matching the production assignment discipline.
+- `play-trajectories.csv` now fuses duplicate replay observations into aligned play-time bins by measured uncertainty while retaining source provenance.
+- reviewed ground-contact labels are now scored separately and included in the promotion gate when present.
+- reviewed team labels are now scored for accuracy/coverage and included in the promotion gate when present.
+- promotion reports distinguish missing/unvalidated evidence (`not_evaluated`) from measured gate failures (`failed`).
+- batch summaries now require every child `promotion_gate` to pass before reporting a complete batch.
+- calibration and reviewed split manifests are preflight-validated before detector/tracker work; source-hash mismatches fail before partial caches are written.
+- reviewed play alignments can carry `source_sha256`; declared mismatches fail before processing.
+- reviewed MOT references are source-hash checked before detector/tracker execution and their cross-shot maps are loaded once per run.
+- every run now writes `analysis-config.json` with the frozen analysis policy and separate evaluation-reference provenance.
+- every run also writes `artifact-validation.json` and checks exported hashes/counts/gate consistency.
+- bounded runs now restrict MOT/contact/cross-shot evaluation to the processed source-frame window while preserving the full reference hash.
+- automatic shot scanning avoids a full PTS-index scan; full-source tracking still retains exact ffprobe PTS, while bounded CFR windows use declared PTS/frame steps.
+- local overlapping-track detection now emits `tracklet-refinement.json` as an unreviewed purity queue; it never mutates raw tracks.
+- reviewed manifests now require source PTS, camera label, reviewer, revision, and timestamp metadata before calibration/identity fitting.
+- reviewed records also carry a bounded annotation-confidence value and ISO-8601 review timestamp.
+- long recordings can be analyzed by source-frame window, and multi-play alignment manifests can be selected explicitly with `--play-id` for each bounded run.
+- the review-pack generator now adds unreviewed Hough field-line hints, while `fit_calibration_timeline.py` turns reviewed manifest landmarks into the validated timeline artifact.
+- `build_play_inventory.py` now creates an unreviewed source-frame/PTS shot inventory for full-game play grouping.
+- team crop evidence is sampled at a declared target rate and exported with ambiguity/coverage so long windows do not retain one crop per frame.
+- alignment play IDs are validated as safe identifiers before batch output paths are created.
+- bounded `--start-frame`/`--end-frame` windows now record scope and prevent partial detector caches from being reused as complete analyses.
+- reviewed PTS maps can carry held-out correspondence validation; a map without a passing validation remains ineligible for identity.
+- final component validation now receives source-frame intervals, so reviewed non-overlapping local fragments can join while simultaneous tracks remain rejected;
+- every reviewed frame evaluator uses deterministic injective attribution with explicit unmatched choices, and promotion requires an explicit reviewed shared-player denominator and gate evidence;
+- fitted play-time maps never fall back to affine extrapolation outside reviewed PTS support, and mismatched or reused event labels are rejected;
+- analysis identity includes the source hash, pipeline version, and tracker CMC settings; cache hits read proxy provenance and become non-promotable when that provenance is absent;
+- bounded batch execution honors declared shot ranges even when a play window starts after source frame zero;
+- cross-shot candidate generation now preserves per-pair overlap, distance, shape, team, uncertainty, score, and rejection evidence in the resolver report;
+- the supplied full-game source now has an ignored, exact-PTS scouting pack at `artifacts/full-game-calibration-review-pack/` with 12 unreviewed frames and 1,200 line hints.
 
 Real footage acceptance is still a data-gated milestone: the generated full-game pack is
 unreviewed, and no accepted identity or calibration score should be reported until the

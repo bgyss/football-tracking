@@ -15,6 +15,18 @@ class CacheMismatch(ValueError):
 
 class DetectionCache:
     @staticmethod
+    def load_provenance(path: str | Path, source_hash: str, detector_config_hash: str) -> dict[str, Any] | None:
+        """Read cache provenance for a non-strict compatibility load.
+
+        Older local caches may not have provenance at all; callers must treat
+        ``None`` as unknown rather than inferring a model or proxy mode.
+        """
+
+        metadata, _ = DetectionCache._read(path, source_hash, detector_config_hash)
+        value = metadata.get("provenance")
+        return dict(value) if isinstance(value, dict) else None
+
+    @staticmethod
     def save(
         path: str | Path,
         source_hash: str,
@@ -37,8 +49,15 @@ class DetectionCache:
                 handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 
     @staticmethod
-    def load(path: str | Path, source_hash: str, detector_config_hash: str) -> dict[int, list[Detection]]:
+    def load(path: str | Path, source_hash: str, detector_config_hash: str, *, frame_start: int = 0, frame_end: int | None = None) -> dict[int, list[Detection]]:
+        if frame_start < 0 or (frame_end is not None and frame_end <= frame_start):
+            raise ValueError("invalid cache frame range")
         _, result = DetectionCache._read(path, source_hash, detector_config_hash)
+        if frame_end is not None:
+            expected = set(range(frame_start, frame_end))
+            missing = sorted(expected - set(result))
+            if missing:
+                raise CacheMismatch(f"cache is missing frame records for requested range: {missing[:5]}")
         return result
 
     @staticmethod

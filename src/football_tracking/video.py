@@ -167,6 +167,12 @@ def _scene_score(previous: np.ndarray, current: np.ndarray) -> float:
     return float(np.mean(cv2.absdiff(previous_gray, current_gray)) / 255.0)
 
 
+def scene_change_score(previous: np.ndarray, current: np.ndarray) -> float:
+    """Return the normalized grayscale difference used for cut scouting."""
+
+    return _scene_score(previous, current)
+
+
 def detect_shots(
     frames: Sequence[np.ndarray] | Iterable[np.ndarray],
     fps: float,
@@ -209,6 +215,8 @@ def iter_video_frames(
     path: str | Path,
     start_frame: int = 0,
     end_frame: int | None = None,
+    *,
+    pts_per_frame: float | None = None,
 ) -> Iterator[tuple[int, int, np.ndarray]]:
     """Yield frame index, source PTS, and BGR pixels without retaining the clip."""
 
@@ -217,18 +225,28 @@ def iter_video_frames(
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(source)
-    pts_values = _frame_pts(source)
+    # Exact ffprobe PTS extraction is useful for a full-source pass but can be
+    # disproportionately expensive for a short window in a long recording.
+    # Callers with a CFR source may provide the declared PTS/frame step; a full
+    # pass still uses the source PTS index by default.
+    pts_values = _frame_pts(source) if (start_frame == 0 and end_frame is None and pts_per_frame is None) else []
+    if pts_per_frame is not None and (not np.isfinite(pts_per_frame) or pts_per_frame <= 0):
+        raise ValueError("pts_per_frame must be positive and finite")
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise RuntimeError(f"unable to open video: {source}")
-    index = 0
+    if start_frame:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        index = start_frame
+    else:
+        index = 0
     try:
         while True:
             ok, frame = capture.read()
             if not ok:
                 break
             if index >= start_frame and (end_frame is None or index < end_frame):
-                pts = pts_values[index] if index < len(pts_values) else index
+                pts = pts_values[index] if index < len(pts_values) else int(round(index * pts_per_frame)) if pts_per_frame is not None else index
                 yield index, pts, frame
             index += 1
             if end_frame is not None and index >= end_frame:

@@ -10,6 +10,7 @@ def test_nfl_landmarks_have_fixed_orientation() -> None:
     assert field_landmark("yardline:20:hash:near") == (20.0, HASH_NEAR_YARDS)
     assert field_landmark("yardline:20:hash:far") == (20.0, HASH_FAR_YARDS)
     assert field_landmark("goal_line:west:sideline:near") == (10.0, 0.0)
+    assert field_landmark("goal_line:west:hash:near") == (10.0, HASH_NEAR_YARDS)
     assert field_landmark("end_line:east:sideline:far") == (120.0, FIELD_WIDTH_YARDS)
 
 

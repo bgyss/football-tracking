@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from .field import field_landmark, validate_field_point
 
 
 class AnnotationError(ValueError):
@@ -20,6 +23,7 @@ class ShotAnnotation:
     end_frame: int
     play_id: str | None
     split: str
+    camera_label: str = "unknown"
 
     def contains(self, frame_index: int) -> bool:
         return self.start_frame <= frame_index < self.end_frame
@@ -39,12 +43,37 @@ class AnnotationManifest:
     landmarks: tuple[dict[str, Any], ...] = ()
 
 
+def _validate_review_metadata(raw: Mapping[str, Any], label: str) -> None:
+    reviewer = str(raw.get("reviewer", "")).strip()
+    reviewed_at = str(raw.get("reviewed_at", "")).strip()
+    if not reviewer or not reviewed_at:
+        raise AnnotationError(f"{label} needs reviewer and reviewed_at metadata")
+    try:
+        timestamp = datetime.fromisoformat(reviewed_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise AnnotationError(f"{label} reviewed_at must be an ISO-8601 timestamp") from error
+    if timestamp.tzinfo is None:
+        raise AnnotationError(f"{label} reviewed_at must include a timezone")
+    try:
+        revision = int(raw.get("revision", 0))
+    except (TypeError, ValueError) as error:
+        raise AnnotationError(f"{label} revision must be positive") from error
+    if revision <= 0:
+        raise AnnotationError(f"{label} revision must be positive")
+    try:
+        confidence = float(raw.get("annotation_confidence"))
+    except (TypeError, ValueError) as error:
+        raise AnnotationError(f"{label} needs annotation_confidence between 0 and 1") from error
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise AnnotationError(f"{label} annotation_confidence must be between 0 and 1")
+
+
 def _box(value: Any) -> tuple[float, float, float, float]:
     try:
         result = tuple(float(item) for item in value)
     except (TypeError, ValueError) as error:
         raise AnnotationError("bbox_xyxy_px must contain four numeric values") from error
-    if len(result) != 4 or result[2] <= result[0] or result[3] <= result[1]:
+    if len(result) != 4 or not all(math.isfinite(item) for item in result) or result[2] <= result[0] or result[3] <= result[1]:
         raise AnnotationError("bbox_xyxy_px must have positive dimensions")
     return result
 
@@ -70,7 +99,10 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
         raise AnnotationError("annotation source sha256 does not match the input video")
     try:
         width, height, frame_count = int(source["width"]), int(source["height"]), int(source["frame_count"])
-        numerator, denominator = int(source["time_base"][0]), int(source["time_base"][1])
+        time_base_value = source["time_base"]
+        if len(time_base_value) != 2:  # type: ignore[arg-type]
+            raise AnnotationError("source time_base must contain exactly two values")
+        numerator, denominator = int(time_base_value[0]), int(time_base_value[1])  # type: ignore[index]
     except (KeyError, TypeError, ValueError, IndexError) as error:
         raise AnnotationError("source metadata is incomplete") from error
     if width <= 0 or height <= 0 or frame_count <= 0 or numerator <= 0 or denominator <= 0:
@@ -95,11 +127,14 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
         play_id = raw_shot.get("play_id")
         play_id = None if play_id is None else str(play_id)
         split = str(raw_shot.get("split", "unassigned"))
+        camera_label = str(raw_shot.get("camera_label", ""))
+        if require_reviewed and not camera_label.strip():
+            raise AnnotationError(f"shot {shot_id} needs camera_label metadata")
         if play_id is not None:
             previous = play_splits.setdefault(play_id, split)
             if previous != split:
                 raise AnnotationError(f"play {play_id} is assigned to conflicting splits")
-        shots[shot_id] = ShotAnnotation(shot_id, start, end, play_id, split)
+        shots[shot_id] = ShotAnnotation(shot_id, start, end, play_id, split, camera_label or "unknown")
     ordered_shots = sorted(shots.values(), key=lambda shot: (shot.start_frame, shot.end_frame, shot.shot_id))
     for previous, current in zip(ordered_shots, ordered_shots[1:]):
         if current.start_frame < previous.end_frame:
@@ -122,10 +157,13 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
             raise AnnotationError(f"annotation {annotation_id} names an unknown shot")
         try:
             frame_index = int(raw["source_frame"])
+            pts = int(raw["pts"])
         except (KeyError, TypeError, ValueError) as error:
-            raise AnnotationError(f"annotation {annotation_id} has no source_frame") from error
+            raise AnnotationError(f"annotation {annotation_id} has no source_frame or pts") from error
         if not shot.contains(frame_index):
             raise AnnotationError(f"annotation {annotation_id} lies outside shot {shot_id}")
+        if pts < 0:
+            raise AnnotationError(f"annotation {annotation_id} has invalid pts")
         if "bbox_xyxy_px" in raw:
             box = _box(raw["bbox_xyxy_px"])
             if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
@@ -134,6 +172,8 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
             raise AnnotationError(f"annotation {annotation_id} must be converted to source coordinates before review")
         if require_reviewed and raw.get("review_status") not in {"reviewed", "accepted"}:
             raise AnnotationError(f"annotation {annotation_id} is not reviewed")
+        if require_reviewed:
+            _validate_review_metadata(raw, f"annotation {annotation_id}")
         annotations.append(dict(raw))
     raw_landmarks = value.get("landmarks", [])
     if not isinstance(raw_landmarks, list):
@@ -153,19 +193,38 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
             raise AnnotationError(f"landmark {landmark_id} names an unknown shot")
         try:
             frame_index = int(raw["source_frame"])
+            pts = int(raw["pts"])
             point = tuple(float(item) for item in raw["image_xy_px"])
             field_point = tuple(float(item) for item in raw["field_xy_yards"])
         except (KeyError, TypeError, ValueError) as error:
             raise AnnotationError(f"landmark {landmark_id} is incomplete") from error
         if not shot.contains(frame_index) or len(point) != 2 or len(field_point) != 2:
             raise AnnotationError(f"landmark {landmark_id} has invalid frame or coordinate shape")
+        if pts < 0:
+            raise AnnotationError(f"landmark {landmark_id} has invalid pts")
         if not all(math.isfinite(item) for item in point + field_point):
             raise AnnotationError(f"landmark {landmark_id} coordinates must be finite")
+        if not 0.0 <= point[0] <= width or not 0.0 <= point[1] <= height:
+            raise AnnotationError(f"landmark {landmark_id} lies outside source image")
+        try:
+            validate_field_point(field_point)
+        except ValueError as error:
+            raise AnnotationError(f"landmark {landmark_id} lies outside the canonical field") from error
+        semantic_id = raw.get("landmark_id")
+        if semantic_id is not None:
+            try:
+                expected = field_landmark(str(semantic_id))
+            except ValueError as error:
+                raise AnnotationError(f"landmark {landmark_id} has invalid semantic landmark_id") from error
+            if math.dist(field_point, expected) > 0.01:
+                raise AnnotationError(f"landmark {landmark_id} field coordinate disagrees with landmark_id")
         role = str(raw.get("role", ""))
         if role not in {"fit", "withheld"}:
             raise AnnotationError(f"landmark {landmark_id} role must be fit or withheld")
         if require_reviewed and raw.get("review_status") not in {"reviewed", "accepted"}:
             raise AnnotationError(f"landmark {landmark_id} is not reviewed")
+        if require_reviewed:
+            _validate_review_metadata(raw, f"landmark {landmark_id}")
         landmarks.append(dict(raw))
     return AnnotationManifest(1, reviewed, source_sha256, width, height, frame_count, (numerator, denominator), shots, tuple(annotations), tuple(landmarks))
 
@@ -182,8 +241,37 @@ def source_bbox_from_crop(
     if resize_xy is None:
         scale_x = scale_y = 1.0
     else:
-        if len(resize_xy) != 2 or float(resize_xy[0]) <= 0 or float(resize_xy[1]) <= 0:
+        if len(resize_xy) != 2 or not all(math.isfinite(float(item)) for item in resize_xy) or float(resize_xy[0]) <= 0 or float(resize_xy[1]) <= 0:
             raise AnnotationError("resize dimensions must be positive")
         scale_x = (crop[2] - crop[0]) / float(resize_xy[0])
         scale_y = (crop[3] - crop[1]) / float(resize_xy[1])
     return (crop[0] + box[0] * scale_x, crop[1] + box[1] * scale_y, crop[0] + box[2] * scale_x, crop[1] + box[3] * scale_y)
+
+
+def manifest_template_from_review_pack(pack: Mapping[str, Any], shots: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Create an unreviewed annotation-manifest skeleton from a review pack."""
+
+    if not isinstance(pack, Mapping) or int(pack.get("schema_version", 0)) != 1:
+        raise AnnotationError("review pack schema_version must be 1")
+    source = pack.get("source")
+    if not isinstance(source, Mapping) or not source.get("sha256"):
+        raise AnnotationError("review pack has no source hash")
+    normalized_shots: dict[str, dict[str, Any]] = {}
+    for shot_id, raw in sorted(shots.items()):
+        if not isinstance(raw, Mapping):
+            raise AnnotationError(f"invalid shot template {shot_id}")
+        try:
+            start, end = int(raw["start_frame"]), int(raw["end_frame"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise AnnotationError(f"shot template {shot_id} needs start_frame/end_frame") from error
+        if start < 0 or end <= start or end > int(source["frame_count"]):
+            raise AnnotationError(f"shot template {shot_id} has an invalid frame range")
+        camera_label = str(raw.get("camera_label", ""))
+        if not camera_label:
+            raise AnnotationError(f"shot template {shot_id} needs camera_label")
+        normalized_shots[str(shot_id)] = {"start_frame": start, "end_frame": end, "play_id": None if raw.get("play_id") is None else str(raw["play_id"]), "split": str(raw.get("split", "unassigned")), "camera_label": camera_label}
+    ordered = sorted(normalized_shots.items(), key=lambda item: (item[1]["start_frame"], item[1]["end_frame"], item[0]))
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[1]["start_frame"] < previous[1]["end_frame"]:
+            raise AnnotationError(f"shot template ranges overlap: {previous[0]} and {current[0]}")
+    return {"schema_version": 1, "reviewed": False, "source": dict(source), "shots": normalized_shots, "annotations": [], "landmarks": [], "review_frames": list(pack.get("frames", [])), "review_policy": "Fill and review all labels, then set reviewed=true."}

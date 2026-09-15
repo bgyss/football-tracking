@@ -6,6 +6,7 @@ import pytest
 
 from football_tracking.replay import (
     PlayAlignment,
+    PlayAlignmentSet,
     PlayAnchor,
     PlayTimeCorrespondence,
     PlayTimeMap,
@@ -23,6 +24,8 @@ def test_play_time_is_anchor_relative_and_shot_scoped() -> None:
     assert alignment.play_time_s("shot-0", 150, 60.0) == pytest.approx(0.5)
     assert alignment.play_time_s("shot-1", 850, 60.0) == pytest.approx(0.5)
     assert alignment.play_time_s("shot-2", 10, 60.0) is None
+    pts_alignment = PlayAlignment("play-2", (PlayAnchor("shot-0", 120, "snap", 1000, 0.25), PlayAnchor("shot-1", 820, "snap", 2000, 0.25)))
+    assert pts_alignment.play_time_at_pts("shot-0", 1100, (1, 1000)) == pytest.approx(0.35)
 
 
 def test_alignment_requires_review_two_shots_and_positive_fps(tmp_path) -> None:
@@ -118,12 +121,40 @@ def test_play_time_map_uses_pts_without_extrapolation() -> None:
     assert mapping.validate([check])["gate"] is True
 
 
+def test_play_time_map_rejects_mismatched_events_between_shots() -> None:
+    with pytest.raises(ReplayAlignmentError, match="same reviewed events"):
+        PlayTimeMap([
+            PlayTimeCorrespondence("shot-0", 100, 0.0, "snap"),
+            PlayTimeCorrespondence("shot-0", 200, 1.0, "contact"),
+            PlayTimeCorrespondence("shot-1", 1000, 0.0, "snap"),
+            PlayTimeCorrespondence("shot-1", 1100, 1.0, "release"),
+        ])
+
+
+def test_fitted_play_time_map_does_not_extrapolate_through_gaps() -> None:
+    mapping = PlayTimeMap([
+        PlayTimeCorrespondence("shot-0", 100, 0.0, "snap"),
+        PlayTimeCorrespondence("shot-0", 200, 1.0, "contact"),
+        PlayTimeCorrespondence("shot-1", 1000, 0.0, "snap"),
+        PlayTimeCorrespondence("shot-1", 1100, 1.0, "contact"),
+    ])
+    alignment = PlayAlignment("play-1", (PlayAnchor("shot-0", 0, "snap"), PlayAnchor("shot-1", 1, "snap")), mapping)
+    assert alignment.play_time_at_pts("shot-0", 50, (1, 100)) is None
+
+
 def test_play_time_map_rejects_nonmonotonic_correspondences() -> None:
     with pytest.raises(ReplayAlignmentError):
         PlayTimeMap([
             PlayTimeCorrespondence("shot-0", 100, 0.0, "snap"),
             PlayTimeCorrespondence("shot-0", 200, 0.0, "contact"),
         ])
+
+
+def test_field_track_rejects_unsorted_or_nonfinite_samples() -> None:
+    with pytest.raises(ValueError, match="ordered"):
+        FieldTrack("t", "shot-0", ((1.0, 0.0, 0.0), (0.5, 0.0, 0.0)))
+    with pytest.raises(ValueError, match="finite"):
+        FieldTrack("t", "shot-0", ((0.0, float("nan"), 0.0), (1.0, 0.0, 0.0)))
 
 
 def test_alignment_loader_accepts_reviewed_pts_correspondences(tmp_path) -> None:
@@ -143,10 +174,59 @@ def test_alignment_loader_accepts_reviewed_pts_correspondences(tmp_path) -> None
     alignment = load_play_alignment(path)
     assert alignment.time_map is not None
     assert alignment.play_time_at_pts("shot-0", 150, (1, 100), fps=100, frame_index=5) == pytest.approx(0.5)
+    assert alignment.timing_eligible is False
+    validated = json.loads(path.read_text(encoding="utf-8"))
+    validated["validation_correspondences"] = [{"shot_id": "shot-0", "source_pts": 150, "play_time_s": 0.5, "event": "release"}, {"shot_id": "shot-1", "source_pts": 1050, "play_time_s": 0.5, "event": "release"}]
+    path.write_text(json.dumps(validated), encoding="utf-8")
+    assert load_play_alignment(path).timing_eligible is True
+
+
+def test_multi_play_alignment_loader_sorts_and_rejects_duplicate_ids(tmp_path) -> None:
+    path = tmp_path / "alignments.json"
+    anchor = lambda shot, frame: {"shot_id": shot, "source_frame": frame, "event": "snap"}
+    path.write_text(json.dumps({"reviewed": True, "plays": [
+        {"play_id": "p2", "anchors": [anchor("shot-2", 20), anchor("shot-3", 30)]},
+        {"play_id": "p1", "anchors": [anchor("shot-0", 0), anchor("shot-1", 10)]},
+    ]}), encoding="utf-8")
+    from football_tracking.replay import load_play_alignments
+    loaded = load_play_alignments(path)
+    assert isinstance(loaded, PlayAlignmentSet)
+    assert [play.play_id for play in loaded.plays] == ["p1", "p2"]
+    serialized = loaded.to_dict()
+    assert serialized["plays"][0]["play_id"] == "p1"
+    with pytest.raises(ReplayAlignmentError, match="duplicate play_id"):
+        PlayAlignmentSet((loaded.plays[0], loaded.plays[0]))
+
+
+def test_alignment_loader_rejects_declared_source_hash_mismatch(tmp_path) -> None:
+    path = tmp_path / "bad-source.json"
+    path.write_text(json.dumps({"reviewed": True, "source_sha256": "expected", "play_id": "p1", "anchors": [{"shot_id": "shot-0", "source_frame": 0}, {"shot_id": "shot-1", "source_frame": 10}]}), encoding="utf-8")
+    with pytest.raises(ReplayAlignmentError, match="source sha256"):
+        load_play_alignment(path, source_sha256="actual")
+
+
+def test_alignment_rejects_unsafe_play_id() -> None:
+    with pytest.raises(ReplayAlignmentError, match="safe identifier"):
+        PlayAlignment("../escape", (PlayAnchor("shot-0", 0, "snap"), PlayAnchor("shot-1", 10, "snap")))
+
+
+def test_alignment_loader_marks_matching_source_hash_validated(tmp_path) -> None:
+    path = tmp_path / "good-source.json"
+    path.write_text(json.dumps({"reviewed": True, "source_sha256": "expected", "play_id": "p1", "anchors": [{"shot_id": "shot-0", "source_frame": 0}, {"shot_id": "shot-1", "source_frame": 10}]}), encoding="utf-8")
+    loaded = load_play_alignment(path, source_sha256="expected")
+    assert loaded.source_hash_validated is True
+    assert loaded.source_sha256 == "expected"
+
+
+def test_alignment_loader_rejects_anchor_outside_declared_shot_range(tmp_path) -> None:
+    path = tmp_path / "outside-range.json"
+    path.write_text(json.dumps({"reviewed": True, "play_id": "p1", "anchors": [{"shot_id": "shot-0", "source_frame": 10}, {"shot_id": "shot-1", "source_frame": 20}], "shot_ranges": {"shot-0": [0, 10], "shot-1": [20, 30]}}), encoding="utf-8")
+    with pytest.raises(ReplayAlignmentError, match="outside its declared shot range"):
+        load_play_alignment(path)
 
 
 from football_tracking.identity import TeamEvidence
-from football_tracking.replay import FieldTrack, cross_shot_candidate_scores
+from football_tracking.replay import FieldTrack, cross_shot_candidate_evidence, cross_shot_candidate_scores
 
 
 def line(tracklet_id, shot_id, x0, y0, *, dx=1.0, count=10, start=0.0, step=0.1):
@@ -221,6 +301,13 @@ def test_scores_are_bounded_and_deterministic() -> None:
     assert all(0.0 <= value <= 1.0 for value in first.values())
 
 
+def test_high_position_uncertainty_abstains_in_candidate_generation() -> None:
+    left = [FieldTrack("shot-0:t1", "shot-0", tuple((index * 0.1, 10.0, 20.0) for index in range(8)), (3.0,) * 8)]
+    right = [FieldTrack("shot-1:t1", "shot-1", tuple((index * 0.1, 10.0, 20.0) for index in range(8)), (3.0,) * 8)]
+    evidence = teams(**{"shot-0:t1": "DET", "shot-1:t1": "DET"})
+    assert cross_shot_candidate_scores(left, right, evidence) == {}
+
+
 def test_paired_samples_enforces_exclusivity_of_right_matches() -> None:
     # Left track: six samples clustered around time 0.0 (start=0.0, step=0.01),
     # giving times 0.00, 0.01, 0.02, 0.03, 0.04, 0.05.
@@ -241,3 +328,22 @@ def test_paired_samples_enforces_exclusivity_of_right_matches() -> None:
     # reintroducing sample reuse would make this test fail.
     scores = cross_shot_candidate_scores(left, right, evidence)
     assert ("shot-0:t1", "shot-1:t1") not in scores
+
+
+def test_sample_pairing_keeps_right_times_monotonic() -> None:
+    left = FieldTrack("shot-0:t1", "shot-0", ((0.021, 0.0, 0.0), (0.022, 1.0, 0.0)))
+    right = FieldTrack("shot-1:t1", "shot-1", ((0.0, 0.0, 0.0), (0.03, 1.0, 0.0)))
+    from football_tracking import replay
+
+    assert replay._paired_indices(left, right, 0.05) == [(0, 1)]
+
+
+def test_candidate_evidence_retains_rejection_reason_and_overlap_metrics() -> None:
+    left = [line("shot-0:t1", "shot-0", 10.0, 20.0, count=3)]
+    right = [line("shot-1:t1", "shot-1", 10.0, 20.0, count=3)]
+    evidence = teams(**{"shot-0:t1": "DET", "shot-1:t1": "DET"})
+    report = cross_shot_candidate_evidence(left, right, evidence)
+    record = report[("shot-0:t1", "shot-1:t1")]
+    assert record["eligible"] is False
+    assert record["rejection_reason"] == "insufficient_overlap_samples"
+    assert record["paired_sample_count"] == 3

@@ -91,7 +91,38 @@ def write_trajectories_csv(path: str | Path, observations: Iterable[Observation]
             writer.writerow({"player_id": row.player_id, "shot_id": row.shot_id, "frame_index": row.frame_index, "pts": row.pts, "x_px": (x1 + x2) / 2.0, "y_px": y2, "x_yards": x_yards, "y_yards": y_yards, "position_source": row.position_source, "calibration_id": row.calibration_id, "calibration_status": row.calibration_status, "position_uncertainty_yards": row.position_uncertainty_yards, "play_time_s": row.play_time_s, "time_map_id": row.time_map_id, "source_tracklet_id": row.source_tracklet_id})
 
 
-def write_calibration_json(path: str | Path, calibrations: Mapping[str, Any]) -> None:
+def write_play_trajectories_csv(path: str | Path, observations: Iterable[Observation], *, cadence_hz: float = 10.0) -> None:
+    """Fuse replay observations into one provenance-preserving play-time trail."""
+
+    if not np.isfinite(cadence_hz) or cadence_hz <= 0:
+        raise ValueError("cadence_hz must be positive and finite")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    bins: dict[tuple[str, str, int], Observation] = {}
+    for observation in observations:
+        if not observation.player_id or not observation.play_id or observation.play_time_s is None or observation.field_xy_yards is None:
+            continue
+        if observation.calibration_status in {"not_provided", "unvalidated", "partial", "invalid"}:
+            continue
+        if observation.time_map_id not in {None, "play-time-map"}:
+            continue
+        bin_index = int(round(observation.play_time_s * cadence_hz))
+        key = (observation.play_id, observation.player_id, bin_index)
+        previous = bins.get(key)
+        quality = (float(observation.position_uncertainty_yards if observation.position_uncertainty_yards is not None else float("inf")), -observation.detection_score, observation.shot_id, observation.frame_index, observation.tracklet_id)
+        previous_quality = None if previous is None else (float(previous.position_uncertainty_yards if previous.position_uncertainty_yards is not None else float("inf")), -previous.detection_score, previous.shot_id, previous.frame_index, previous.tracklet_id)
+        if previous is None or quality < previous_quality:
+            bins[key] = observation
+    fieldnames = ["player_id", "play_id", "play_time_s", "x_yards", "y_yards", "shot_id", "frame_index", "pts", "position_uncertainty_yards", "calibration_id", "source_tracklet_id"]
+    with destination.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for (play_id, player_id, bin_index), observation in sorted(bins.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])):
+            x_yards, y_yards = observation.field_xy_yards
+            writer.writerow({"player_id": player_id, "play_id": play_id, "play_time_s": bin_index / cadence_hz, "x_yards": x_yards, "y_yards": y_yards, "shot_id": observation.shot_id, "frame_index": observation.frame_index, "pts": observation.pts, "position_uncertainty_yards": observation.position_uncertainty_yards, "calibration_id": observation.calibration_id, "source_tracklet_id": observation.source_tracklet_id})
+
+
+def write_calibration_json(path: str | Path, calibrations: Mapping[str, Any], *, source_sha256: str | None = None) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not calibrations:
@@ -111,6 +142,7 @@ def write_calibration_json(path: str | Path, calibrations: Mapping[str, Any]) ->
                 "withheld_median_error_yards": calibration.withheld_median_error_yards,
                 "withheld_p95_error_yards": calibration.withheld_p95_error_yards,
                 "withheld_point_count": calibration.withheld_point_count,
+                "withheld_errors_yards": calibration.withheld_errors_yards,
                 "inlier_count": calibration.inlier_count,
                 "point_count": calibration.point_count,
                 "reprojection_threshold_px": calibration.reprojection_threshold_px,
@@ -118,6 +150,8 @@ def write_calibration_json(path: str | Path, calibrations: Mapping[str, Any]) ->
                 "status": calibration.status,
                 "reason": calibration.reason,
             }
+    if source_sha256 is not None:
+        value["source_sha256"] = source_sha256
     destination.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 

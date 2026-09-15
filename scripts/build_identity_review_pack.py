@@ -14,6 +14,23 @@ from football_tracking.metrics import sha256_file
 from football_tracking.video import VideoInfo
 
 
+def field_line_proposals(image_bgr) -> list[dict[str, object]]:
+    """Return unreviewed white-line segment hints for calibration review."""
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 180)
+    lines = cv2.HoughLinesP(edges, 1.0, 3.141592653589793 / 180.0, threshold=45, minLineLength=35, maxLineGap=12)
+    if lines is None:
+        return []
+    candidates: list[tuple[float, list[int]]] = []
+    for line in lines.reshape(-1, 4):
+        x1, y1, x2, y2 = (int(value) for value in line)
+        length = float(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+        candidates.append((length, [x1, y1, x2, y2]))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return [{"segment_xyxy_px": segment, "length_px": length, "review_status": "unreviewed"} for length, segment in candidates[:100]]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -55,7 +72,7 @@ def main() -> int:
             if not cv2.imwrite(str(frame_dir / filename), image, [cv2.IMWRITE_JPEG_QUALITY, 95]):
                 raise SystemExit(f"unable to write {filename}")
             pts = pts_values[frame] if frame < len(pts_values) else int(round(frame * info.time_base[1] / (info.source_fps * info.time_base[0])))
-            records.append({"source_frame": frame, "pts": pts, "pts_method": "source_index" if frame < len(pts_values) else "constant_rate_derivation", "image": f"frames/{filename}", "proposals": proposals[frame], "review_status": "unreviewed"})
+            records.append({"source_frame": frame, "pts": pts, "pts_method": "source_index" if frame < len(pts_values) else "constant_rate_derivation", "image": f"frames/{filename}", "proposals": proposals[frame], "field_line_proposals": field_line_proposals(image), "review_status": "unreviewed"})
     finally:
         capture.release()
     manifest = {

@@ -6,8 +6,9 @@ import cv2
 import numpy as np
 import pytest
 
-from football_tracking.calibration_timeline import CalibrationTimelineError, estimate_field_motion, load_calibration_timeline, propagate_homography
-from football_tracking.calibration import FieldPoint, Homography, ImagePoint
+from football_tracking.calibration_timeline import CalibrationTimelineError, estimate_field_motion, load_calibration_timeline, propagate_homography, static_field_mask, timeline_from_landmark_records
+from football_tracking.calibration import FieldPoint, Homography, ImagePoint, project_observation
+from football_tracking.schema import Observation
 
 
 def config(scale: float = 10.0) -> dict:
@@ -45,6 +46,49 @@ def test_timeline_export_round_trips_validity(tmp_path) -> None:
     assert reloaded.at("shot-0", 50).identity_eligible is True
 
 
+def test_timeline_marks_unvalidated_intervals_ineligible_even_with_valid_neighbor(tmp_path) -> None:
+    path = tmp_path / "mixed.json"
+    valid = {**config(), "pts_start": 0, "pts_end": 100}
+    unvalidated = {"image_points": [[0, 0], [100, 0], [100, 100], [0, 100]], "field_points": [[0, 0], [10, 0], [10, 10], [0, 10]], "pts_start": 100, "pts_end": 200}
+    path.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [valid, unvalidated]}}}), encoding="utf-8")
+    timeline = load_calibration_timeline(path)
+    assert timeline.at("shot-0", 50).identity_eligible is True
+    assert timeline.at("shot-0", 150).identity_eligible is False
+
+
+def test_support_polygon_invalidates_contact_outside_camera_support() -> None:
+    h = Homography.fit([ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)], [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)])
+    observation = Observation(run_id="r", shot_id="s", frame_index=0, pts=0, time_base=(1, 60), tracklet_id="s:t", player_id=None, bbox_xyxy_px=(90, 90, 95, 95), detection_score=0.9, team="unknown", team_score=0.0, jersey_number=None, field_xy_yards=None, position_source=None, calibration_id=None, identity_version=1)
+    projected = project_observation(observation, h, support_polygon_px=((0, 0), (80, 0), (80, 80), (0, 80)))
+    assert projected.field_xy_yards is None
+    assert projected.calibration_status == "invalid"
+
+
+def test_timeline_from_reviewed_landmarks_requires_withheld_points() -> None:
+    records = []
+    image = [(0, 0), (100, 0), (100, 100), (0, 100)]
+    field = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    for index, (image_point, field_point) in enumerate(zip(image, field)):
+        records.append({"shot_id": "shot-0", "source_frame": 10, "source_pts": 1000, "image_xy_px": image_point, "field_xy_yards": field_point, "role": "fit", "id": f"fit-{index}"})
+    records.append({"shot_id": "shot-0", "source_frame": 10, "source_pts": 1000, "image_xy_px": (50, 50), "field_xy_yards": (5, 5), "role": "withheld", "id": "withheld"})
+    timeline = timeline_from_landmark_records(records)
+    assert timeline.at("shot-0", 1000).identity_eligible is True
+    with pytest.raises(CalibrationTimelineError, match="withheld"):
+        timeline_from_landmark_records([record for record in records if record["role"] == "fit"])
+
+
+def test_timeline_rejects_mirrored_semantic_landmark_coordinates() -> None:
+    records = []
+    image = [(0, 0), (100, 0), (100, 100), (0, 100)]
+    field = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    ids = ["yardline:20:sideline:near", "yardline:40:sideline:near", "yardline:40:sideline:far", "yardline:20:sideline:far"]
+    for index, (image_point, field_point) in enumerate(zip(image, field)):
+        records.append({"id": f"fit-{index}", "landmark_id": ids[index], "shot_id": "shot-0", "source_frame": 10, "source_pts": 1000, "image_xy_px": image_point, "field_xy_yards": field_point, "role": "fit"})
+    records.append({"id": "withheld", "landmark_id": "yardline:30:sideline:near", "shot_id": "shot-0", "source_frame": 10, "source_pts": 1000, "image_xy_px": (50, 50), "field_xy_yards": (30, 0), "role": "withheld"})
+    with pytest.raises(CalibrationTimelineError, match="semantic landmark"):
+        timeline_from_landmark_records(records)
+
+
 def test_timeline_rejects_overlapping_intervals(tmp_path) -> None:
     path = tmp_path / "timeline.json"
     first = {**config(), "pts_start": 0, "pts_end": 100}
@@ -52,6 +96,13 @@ def test_timeline_rejects_overlapping_intervals(tmp_path) -> None:
     path.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [first, second]}}}), encoding="utf-8")
     with pytest.raises(CalibrationTimelineError, match="overlapping"):
         load_calibration_timeline(path)
+
+
+def test_timeline_rejects_declared_source_hash_mismatch(tmp_path) -> None:
+    path = tmp_path / "timeline.json"
+    path.write_text(json.dumps({"schema_version": 2, "source_sha256": "expected", "shots": {"shot-0": {"keyframes": [{**config(), "pts_start": 0, "pts_end": 100}]}}}), encoding="utf-8")
+    with pytest.raises(CalibrationTimelineError, match="sha256"):
+        load_calibration_timeline(path, source_sha256="actual")
 
 
 def test_propagation_composes_current_to_keyframe_direction() -> None:
@@ -66,6 +117,12 @@ def test_propagation_composes_current_to_keyframe_direction() -> None:
 def test_estimate_field_motion_returns_none_without_spatial_support() -> None:
     frame = np.zeros((60, 80, 3), dtype=np.uint8)
     assert estimate_field_motion(frame, frame) is None
+
+
+def test_static_field_mask_excludes_dynamic_boxes_with_margin() -> None:
+    mask = static_field_mask((20, 30), [(10, 5, 15, 10)], margin_px=2)
+    assert mask[5, 10] == 0
+    assert mask[0, 0] == 255
 
 
 def test_estimate_field_motion_recovers_a_translation_from_static_texture() -> None:

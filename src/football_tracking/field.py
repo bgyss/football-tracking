@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import math
 
 FIELD_LENGTH_YARDS = 120.0
 FIELD_WIDTH_YARDS = 160.0 / 3.0
@@ -36,7 +37,7 @@ def field_landmark(landmark_id: str) -> tuple[float, float]:
             x = float(tokens[1])
         except ValueError as error:
             raise ValueError(f"invalid yardline in {landmark_id!r}") from error
-        if not 0.0 <= x <= FIELD_LENGTH_YARDS:
+        if not math.isfinite(x) or not 0.0 <= x <= FIELD_LENGTH_YARDS:
             raise ValueError("yardline must lie within the 120-yard field")
         row = tokens[-1]
         if len(tokens) >= 4 and tokens[-2] in {"hash", "hashmark", "hashmarks"}:
@@ -60,6 +61,11 @@ def field_landmark(landmark_id: str) -> tuple[float, float]:
         if x is None:
             raise ValueError(f"unknown field end in {landmark_id!r}")
         row = tokens[-1]
+        if len(tokens) >= 4 and tokens[-2] in {"hash", "hashmark", "hashmarks"}:
+            if row in {"near", "home", "a"}:
+                return (x, HASH_NEAR_YARDS)
+            if row in {"far", "away", "b"}:
+                return (x, HASH_FAR_YARDS)
         if row in {"near", "sideline"}:
             return (x, 0.0)
         if row == "far":
@@ -75,6 +81,6 @@ def validate_field_point(point: tuple[float, float] | list[float]) -> tuple[floa
     if len(point) != 2:
         raise ValueError("field point must contain x and y")
     x, y = float(point[0]), float(point[1])
-    if not 0.0 <= x <= FIELD_LENGTH_YARDS or not 0.0 <= y <= FIELD_WIDTH_YARDS:
+    if not math.isfinite(x) or not math.isfinite(y) or not 0.0 <= x <= FIELD_LENGTH_YARDS or not 0.0 <= y <= FIELD_WIDTH_YARDS:
         raise ValueError("field point lies outside the 120 by 53 1/3 yard field")
     return (x, y)

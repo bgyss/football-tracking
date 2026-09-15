@@ -92,6 +92,35 @@ shots, the resolver abstains by design and `identity-links.json` records
 [docs/evidence/cross-shot-identity.md](docs/evidence/cross-shot-identity.md)
 for the measured state of this milestone on the current assets.
 
+When a reviewed reference is supplied, `tracking-evaluation.json` also contains a
+`promotion_gate`. It stays `not_evaluated` until standard TrackEval metrics, valid
+calibration, and cross-shot precision/coverage evidence are all present; proxy or
+missing-reference results never count as acceptance.
+The same promotion decision is copied into `review.json` for quick inspection.
+
+For a PTS-based alignment to be eligible for identity, include at least two
+reviewed correspondences per shot plus separate `validation_correspondences`;
+the latter must pass the configured timing residual gate. A snap-only anchor
+remains an explicitly unvalidated equal-rate compatibility mode.
+
+An alignment file may contain a reviewed `plays` array. Select one play per
+bounded run with `--play-id`; omitting it from a multi-play file fails rather
+than silently choosing the first play.
+
+For a reviewed alignment set with `shot_ranges`, `batch` runs each play in a separate
+bounded directory and writes a top-level `batch.json` summary:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python -m football_tracking batch \
+  --input data/all-22-lions-rams.mp4 \
+  --output artifacts/game-batch \
+  --detector synthetic --tracker iou \
+  --play-alignment /path/to/reviewed-play-alignments.json
+```
+
+`batch.json` distinguishes execution completion from identity completion and uses
+`complete_with_unresolved` until every child has a resolved identity result.
+
 For a tracker that fragments within one view, prepare a reviewed split overlay
 and pass it with `--reviewed-splits`. The raw tracker observations and cache are
 preserved; only the derived identity segments use the reviewed split IDs:
@@ -104,14 +133,16 @@ UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
   --reviewed-splits /path/to/reviewed-splits.json
 ```
 
-The split file must contain `{"reviewed": true, "splits": ...}` and every
-observed source tracklet frame must belong to exactly one reviewed segment.
+The split file must contain `{"reviewed": true, "source_sha256": "...", "splits": ...}`
+matching the input video, and every observed source tracklet frame must belong to exactly
+one reviewed segment.
 
 For moving cameras, `--calibration` also accepts a schema-v2 timeline whose
 keyframes carry `pts_start`, `pts_end`, fitting landmarks, and independent
 `withheld_image_points`/`withheld_field_points`. Only keyframes that pass the
 withheld geometry gate are eligible for cross-shot identity; gaps remain
-unresolved.
+unresolved. A generated timeline also carries the input `source_sha256` so it
+cannot be applied accidentally to another video.
 
 To start reviewing the supplied long recording, extract exact scouting frames into an
 ignored pack (this does not upload or modify the source video):
@@ -119,12 +150,52 @@ ignored pack (this does not upload or modify the source video):
 ```bash
 UV_CACHE_DIR=.uv-cache uv run python scripts/build_identity_review_pack.py \
   --input data/all-22-lions-rams.mp4 \
-  --output artifacts/full-game-calibration-review-pack \
+  --output artifacts/full-game-calibration-review-pack --exact-pts \
   --frame 1798 --frame 2098 --frame 2398
 ```
 
 The pack is marked `reviewed: false` until a human records shot intervals, semantic field
 landmarks, timing correspondences, and identity labels.
+
+Generate a durable, unreviewed shot inventory before selecting paired plays:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/build_play_inventory.py \
+  --input data/all-22-lions-rams.mp4 \
+  --output artifacts/full-game-shot-inventory.json
+```
+
+The inventory records candidate boundaries, source frame/PTS ranges, and confidence. A
+reviewer must confirm cuts, camera labels, play IDs, and split assignments before using it.
+
+Create a strict annotation-manifest template from that pack by declaring the reviewed shot
+ranges and camera labels:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/build_annotation_manifest.py \
+  --review-pack artifacts/full-game-calibration-review-pack/review-pack.json \
+  --output artifacts/full-game-calibration-review-pack/manifest-template.json \
+  --shot shot-0:1798:2398:sideline:play-0042:development
+```
+
+The generated template remains `reviewed: false` until boxes, landmarks, contacts, timing,
+and identity labels have been reviewed.
+
+After review, fit the timeline directly from the manifest:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/fit_calibration_timeline.py \
+  --annotations /path/to/reviewed-manifest.json \
+  --source data/all-22-lions-rams.mp4 \
+  --output artifacts/calibration-timeline.json
+```
+
+Long recordings should be processed in source-frame windows with `--start-frame` and
+`--end-frame`. Window outputs record their scope in `metrics.json`; a partial detector
+cache is never treated as a complete cache for another window, and windowed annotated
+videos intentionally omit source audio until an offset-aware muxer is added. On this
+constant-rate All-22 source, bounded windows derive PTS from the declared frame step;
+full-source runs retain the exact ffprobe PTS index.
 
 ## Memory guard
 
@@ -172,7 +243,7 @@ UV_CACHE_DIR=.uv-cache uv run python -m football_tracking benchmark \
   --manual-cut 712
 ```
 
-The run writes `annotated.mp4`, `observations.csv`, `observations.parquet`, `identities.json`, `field-view.png`, `trajectories.csv`, `shots.json`, `calibration.json`, `identity-links.json`, `review.json`, `metrics.json`, `run-manifest.json`, and the detector cache. `trajectories.csv` always contains image-space contact points; its yard columns are populated only with a valid shot-specific landmark file passed through `--calibration`. Image-space trails are always available in the annotated video.
+The run writes `annotated.mp4`, `observations.csv`, `observations.parquet`, `identities.json`, `field-view.png`, `trajectories.csv`, `play-trajectories.csv`, `shots.json`, `calibration.json`, `calibration-quality.json`, `tracklet-refinement.json`, `identity-links.json`, `analysis-config.json`, `review.json`, `metrics.json`, `artifact-validation.json`, `run-manifest.json`, and the detector cache. `analysis-config.json` is the frozen, schema-versioned provenance record for reproducing the analysis; `artifact-validation.json` checks cross-file consistency. `trajectories.csv` always contains image-space contact points; its yard columns are populated only with a valid shot-specific landmark file passed through `--calibration`. `play-trajectories.csv` is the deduplicated, aligned play-time view and preserves the source shot/frame selected for each bin. Image-space trails are always available in the annotated video.
 
 ## Local evidence from the supplied clip
 

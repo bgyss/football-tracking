@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from football_tracking.calibration import FieldPoint, Homography, ImagePoint, load_calibrations, project_observation
+from football_tracking.calibration import FieldPoint, Homography, ImagePoint, calibration_quality_report, load_calibrations, project_observation
 from football_tracking.schema import Observation
 
 
@@ -70,6 +72,27 @@ def test_load_calibrations_supports_shot_specific_landmarks(tmp_path) -> None:
     assert calibrations["shot-1"].project(ImagePoint(100, 100)) == FieldPoint(10.0, 10.0)
 
 
+def test_calibration_export_round_trips_through_legacy_loader(tmp_path) -> None:
+    from football_tracking.export import write_calibration_json
+
+    fitted = Homography.fit(
+        [ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)],
+        [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)],
+    )
+    path = tmp_path / "exported.json"
+    write_calibration_json(path, {"shot-0": fitted})
+    loaded = load_calibrations(path)
+    assert loaded["shot-0"].matrix == fitted.matrix
+    assert loaded["shot-0"].status == "unvalidated"
+
+
+def test_legacy_calibration_rejects_a_declared_source_hash_mismatch(tmp_path) -> None:
+    path = tmp_path / "mismatch.json"
+    path.write_text(json.dumps({"source_sha256": "expected", "image_points": [[0, 0], [100, 0], [100, 100], [0, 100]], "field_points": [[0, 0], [10, 0], [10, 10], [0, 10]]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="sha256"):
+        load_calibrations(path, source_sha256="actual")
+
+
 def test_homography_reports_pixel_and_field_residuals_in_their_own_units() -> None:
     image = [ImagePoint(0, 0), ImagePoint(1000, 0), ImagePoint(1000, 500), ImagePoint(0, 500), ImagePoint(500, 250)]
     field = [FieldPoint(0, 0), FieldPoint(120, 0), FieldPoint(120, 53.333), FieldPoint(0, 53.333), FieldPoint(60, 26.666)]
@@ -87,6 +110,13 @@ def test_homography_uses_withheld_landmarks_for_validation_status() -> None:
     assert transform.status == "valid"
     assert transform.withheld_point_count == 1
     assert transform.withheld_p95_error_yards == pytest.approx(0.0)
+    observation = Observation(
+        run_id="r", shot_id="s", frame_index=0, pts=0, time_base=(1, 60), tracklet_id="s:t", player_id=None,
+        bbox_xyxy_px=(10, 10, 20, 50), detection_score=0.9, team="unknown", team_score=0.0,
+        jersey_number=None, field_xy_yards=None, position_source=None, calibration_id=None, identity_version=1,
+    )
+    projected = project_observation(observation, transform)
+    assert projected.position_uncertainty_yards == pytest.approx(0.0)
 
 
 def test_projection_rejects_nonfinite_or_off_field_contact() -> None:
@@ -96,3 +126,8 @@ def test_projection_rejects_nonfinite_or_off_field_contact() -> None:
     )
     assert transform.project(ImagePoint(float("nan"), 50)) is None
     assert transform.project(ImagePoint(2000, 50)) is None
+
+
+def test_calibration_quality_report_requires_withheld_validation() -> None:
+    unvalidated = Homography.fit([ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)], [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)])
+    assert calibration_quality_report({"shot-0": unvalidated})["status"] == "unvalidated"

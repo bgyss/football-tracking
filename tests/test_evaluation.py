@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from football_tracking.evaluation import EvaluationError, evaluate_tracking, load_reviewed_mot_reference, load_cross_shot_identity, evaluate_cross_shot_identity
+from football_tracking.evaluation import EvaluationError, ReferenceFrame, ReferenceObject, evaluate_ground_contact_positions, evaluate_promotion_gates, evaluate_team_assignment, evaluate_tracking, load_reviewed_mot_reference, load_cross_shot_identity, evaluate_cross_shot_identity, restrict_reference_to_window
+from football_tracking.schema import Observation
 from football_tracking.tracking import TrackObservation
 
 
@@ -51,12 +52,43 @@ def test_evaluator_distinguishes_perfect_swap_and_gap_sequences(tmp_path) -> Non
     assert gapped["aggregate"]["fragmentation"] == 1
 
 
+def test_standard_identity_metric_is_not_detection_f1_for_alternating_ids(tmp_path) -> None:
+    pytest.importorskip("trackeval")
+    reference = {
+        "shot-0": {
+            0: ReferenceFrame(0, 1, True, False, (ReferenceObject("a", (0, 0, 10, 10)), ReferenceObject("b", (20, 0, 30, 10)))),
+            1: ReferenceFrame(1, 2, True, False, (ReferenceObject("a", (0, 0, 10, 10)), ReferenceObject("b", (20, 0, 30, 10)))),
+        }
+    }
+    predictions = [track("shot-0:t1", 0), track("shot-0:t2", 0, (20, 0, 30, 10)), track("shot-0:t2", 1), track("shot-0:t1", 1, (20, 0, 30, 10))]
+    report = evaluate_tracking(predictions, reference)
+    assert report["per_shot"]["shot-0"]["detection_f1"] == pytest.approx(1.0)
+    assert report["standard_metrics"]["aggregate"]["IDF1"] < 1.0
+
+
 def test_reference_rejects_unreviewed_data(tmp_path) -> None:
     path = tmp_path / "unreviewed.json"
     path.write_text('{"reviewed": false, "sequences": {}}', encoding="utf-8")
 
     with pytest.raises(EvaluationError, match="reviewed"):
         load_reviewed_mot_reference(path)
+
+
+def test_reference_preserves_pts_and_rejects_invalid_pts(tmp_path) -> None:
+    valid = tmp_path / "valid-pts.json"
+    valid.write_text(json.dumps({"reviewed": True, "sequences": {"shot-0": {"frames": {"0": {"pts": 100, "labeled": True, "objects": []}}}}}), encoding="utf-8")
+    assert load_reviewed_mot_reference(valid)["shot-0"][0].pts == 100
+    invalid = tmp_path / "invalid-pts.json"
+    invalid.write_text(json.dumps({"reviewed": True, "sequences": {"shot-0": {"frames": {"0": {"pts": "bad", "labeled": True, "objects": []}}}}}), encoding="utf-8")
+    with pytest.raises(EvaluationError, match="pts"):
+        load_reviewed_mot_reference(invalid)
+
+
+def test_reference_window_restriction_preserves_shots_and_frame_scope() -> None:
+    reference = {"shot-0": {0: ReferenceFrame(0, 1, True, False, ()), 1: ReferenceFrame(1, 2, True, False, ()), 3: ReferenceFrame(3, 4, True, False, ())}, "shot-1": {2: ReferenceFrame(2, 3, True, False, ())}}
+    restricted = restrict_reference_to_window(reference, 1, 3)
+    assert set(restricted["shot-0"]) == {1}
+    assert set(restricted["shot-1"]) == {2}
 
 
 def test_evaluator_emits_trackeval_metrics_when_optional_dependency_is_installed(tmp_path) -> None:
@@ -173,6 +205,28 @@ def test_cross_shot_evaluation_is_not_evaluated_without_identity_map(tmp_path) -
     assert "cross_shot_identity" in report["reason"]
 
 
+def test_bounded_reference_window_does_not_count_unseen_shots_in_shared_denominator(tmp_path) -> None:
+    path = _two_shot_reference(tmp_path)
+    reference = restrict_reference_to_window(load_reviewed_mot_reference(path), 0, 1)
+    report = evaluate_cross_shot_identity({}, [], reference, load_cross_shot_identity(path))
+    assert report["status"] == "not_evaluated"
+    assert "at least two shots" in report["reason"]
+
+
+def test_cross_shot_evaluation_excludes_unknown_truth_from_shared_denominator() -> None:
+    reference = {
+        "shot-0": {0: ReferenceFrame(0, 1, True, False, (ReferenceObject("a", (0, 0, 10, 10)),))},
+        "shot-1": {0: ReferenceFrame(0, 1, True, False, (ReferenceObject("b", (0, 0, 10, 10)),))},
+    }
+    report = evaluate_cross_shot_identity(
+        {},
+        [],
+        reference,
+        {"shot-0": {"a": "unknown"}, "shot-1": {"b": "unknown"}},
+    )
+    assert report["status"] == "not_evaluated"
+
+
 def test_cross_shot_coverage_denominator_keeps_reviewed_player_missed_by_detector(tmp_path) -> None:
     path = _two_shot_reference(tmp_path)
     reference = load_reviewed_mot_reference(path)
@@ -185,3 +239,55 @@ def test_cross_shot_coverage_denominator_keeps_reviewed_player_missed_by_detecto
     assert report["shared_player_coverage"] == {"correct": 1, "eligible": 2, "value": 0.5}
     assert report["gate"]["coverage_at_least_0_80"] is False
     assert report["missing_shared_players"] == ["PLAYER-B"]
+
+
+def test_nonoverlapping_fragments_do_not_count_as_component_contamination() -> None:
+    reference = {
+        "shot-0": {
+            0: ReferenceFrame(0, 1, True, False, (ReferenceObject("a0", (0, 0, 10, 10)),)),
+            1: ReferenceFrame(1, 2, True, False, (ReferenceObject("a1", (0, 0, 10, 10)),)),
+        },
+        "shot-1": {10: ReferenceFrame(10, 11, True, False, (ReferenceObject("b", (0, 0, 10, 10)),))},
+    }
+    predictions = [track("shot-0:t1", 0), track("shot-0:t2", 1), track("shot-1:t3", 10)]
+    truth = {"shot-0": {"a0": "PLAYER-A", "a1": "PLAYER-A"}, "shot-1": {"b": "PLAYER-A"}}
+    report = evaluate_cross_shot_identity({"shot-0:t1": "P01", "shot-0:t2": "P01", "shot-1:t3": "P01"}, predictions, reference, truth)
+    assert report["component_contamination"] == {}
+    assert report["gate"]["components_clean"] is True
+
+
+def test_promotion_gates_do_not_promote_missing_or_weak_evidence() -> None:
+    missing = evaluate_promotion_gates({"standard_metrics": {"status": "unavailable"}}, None, {"status": "valid"})
+    assert missing["status"] == "not_evaluated"
+    unvalidated = evaluate_promotion_gates({"standard_metrics": {"status": "evaluated", "aggregate": {"IDF1": 0.95}, "per_shot": {"shot-0": {"IDF1": 0.95, "id_switches": 0}}}}, {"status": "evaluated", "false_merges": 0, "coverage": 0.9, "shared_player_coverage": {"correct": 9, "eligible": 10}, "gate": {"components_clean": True, "false_merges_zero": True}}, {"status": "unvalidated"})
+    assert unvalidated["status"] == "not_evaluated"
+    failed = evaluate_promotion_gates({"standard_metrics": {"status": "evaluated", "aggregate": {"IDF1": 0.95}, "per_shot": {"shot-0": {"IDF1": 0.95, "id_switches": 0}}}}, {"status": "evaluated", "false_merges": 1, "coverage": 1.0, "shared_player_coverage": {"correct": 10, "eligible": 10}, "gate": {"components_clean": True, "false_merges_zero": False}}, {"status": "valid", "gate": {"median_at_most_1_yard": True, "p95_at_most_2_yards": True}})
+    assert failed["status"] == "failed"
+    passed = evaluate_promotion_gates({"standard_metrics": {"status": "evaluated", "aggregate": {"IDF1": 0.95}, "per_shot": {"shot-0": {"IDF1": 0.95, "id_switches": 0}}}}, {"status": "evaluated", "false_merges": 0, "coverage": 0.9, "shared_player_coverage": {"correct": 9, "eligible": 10}, "gate": {"components_clean": True, "false_merges_zero": True}}, {"status": "valid", "gate": {"median_at_most_1_yard": True, "p95_at_most_2_yards": True}})
+    assert passed["status"] == "passed"
+    weak_shot = evaluate_promotion_gates({"standard_metrics": {"status": "evaluated", "aggregate": {"IDF1": 0.95}, "per_shot": {"shot-0": {"IDF1": 0.95, "id_switches": 0}, "shot-1": {"IDF1": 0.5, "id_switches": 0}}}}, {"status": "evaluated", "false_merges": 0, "coverage": 0.9, "shared_player_coverage": {"correct": 9, "eligible": 10}, "gate": {"components_clean": True, "false_merges_zero": True}}, {"status": "valid", "gate": {"median_at_most_1_yard": True, "p95_at_most_2_yards": True}})
+    assert weak_shot["status"] == "failed"
+    proxy = evaluate_promotion_gates({"standard_metrics": {"status": "evaluated", "aggregate": {"IDF1": 0.95}, "per_shot": {"shot-0": {"IDF1": 0.95, "id_switches": 0}}}}, {"status": "evaluated", "false_merges": 0, "coverage": 0.9, "shared_player_coverage": {"correct": 9, "eligible": 10}, "gate": {"components_clean": True, "false_merges_zero": True}}, {"status": "valid", "gate": {"median_at_most_1_yard": True, "p95_at_most_2_yards": True}}, proxy_detector=True)
+    assert proxy["status"] == "not_evaluated"
+
+
+def test_ground_contact_evaluation_reports_position_error_and_missing_contacts() -> None:
+    reference = {"shot-0": {0: ReferenceFrame(0, 1, True, False, (ReferenceObject("a", (0, 0, 10, 10), (1.0, 2.0)), ReferenceObject("b", (20, 0, 30, 10), (20.0, 2.0))))}}
+    observation = Observation(run_id="r", shot_id="shot-0", frame_index=0, pts=0, time_base=(1, 60), tracklet_id="shot-0:t1", player_id="P01", bbox_xyxy_px=(0, 0, 10, 10), detection_score=0.9, team="DET", team_score=1.0, jersey_number=None, field_xy_yards=(2.0, 2.0), position_source="bottom_center", calibration_id="cal", identity_version=2)
+    report = evaluate_ground_contact_positions([observation], reference)
+    assert report["status"] == "evaluated"
+    assert report["evaluated_contacts"] == 1
+    assert report["invalid_or_missing"] == 1
+    assert report["median_error_yards"] == 1.0
+
+
+def test_team_assignment_reports_accuracy_and_coverage() -> None:
+    reference = {"shot-0": {0: ReferenceFrame(0, 1, True, False, (ReferenceObject("a", (0, 0, 10, 10), team="DET"), ReferenceObject("b", (20, 0, 30, 10), team="LAR")))}}
+    observations = [
+        Observation(run_id="r", shot_id="shot-0", frame_index=0, pts=0, time_base=(1, 60), tracklet_id="shot-0:t1", player_id="P01", bbox_xyxy_px=(0, 0, 10, 10), detection_score=0.9, team="DET", team_score=1.0, jersey_number=None, field_xy_yards=None, position_source=None, calibration_id=None, identity_version=2),
+        Observation(run_id="r", shot_id="shot-0", frame_index=0, pts=0, time_base=(1, 60), tracklet_id="shot-0:t2", player_id="P02", bbox_xyxy_px=(20, 0, 30, 10), detection_score=0.9, team="DET", team_score=1.0, jersey_number=None, field_xy_yards=None, position_source=None, calibration_id=None, identity_version=2),
+    ]
+    report = evaluate_team_assignment(observations, reference)
+    assert report["accuracy"] == 0.5
+    assert report["coverage"] == 1.0
+    assert report["gate"]["accuracy_at_least_0_98"] is False

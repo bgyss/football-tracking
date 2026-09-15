@@ -6,6 +6,8 @@ import numpy as np
 import csv
 
 from football_tracking.cli import build_parser, main
+from football_tracking.metrics import sha256_file
+from football_tracking.video import VideoInfo, frame_pts
 
 
 def make_video(path) -> None:
@@ -23,6 +25,42 @@ def test_parser_exposes_run_and_benchmark_commands() -> None:
     assert parser.parse_args(["run", "--input", "video.mp4", "--output", "out"]).command == "run"
     assert parser.parse_args(["benchmark", "--input", "video.mp4", "--output", "out"]).command == "benchmark"
     assert parser.parse_args(["cache", "--input", "video.mp4", "--output", "chunk.jsonl", "--detector-class-mapping", "classes.json"]).command == "cache"
+
+
+def test_parser_accepts_play_selection_for_multi_play_alignment() -> None:
+    args = build_parser().parse_args(["run", "--input", "video.mp4", "--output", "out", "--play-alignment", "alignments.json", "--play-id", "p1"])
+    assert args.play_id == "p1"
+
+
+def test_batch_runs_each_reviewed_play_in_its_own_directory(tmp_path) -> None:
+    input_path = tmp_path / "batch.mp4"
+    make_video(input_path)
+    alignment = tmp_path / "alignments.json"
+    alignment.write_text(json.dumps({"reviewed": True, "plays": [
+        {"play_id": "p1", "anchors": [{"shot_id": "shot-0", "source_frame": 0}, {"shot_id": "shot-1", "source_frame": 2}], "shot_ranges": {"shot-0": [0, 2], "shot-1": [2, 4]}},
+        {"play_id": "p2", "anchors": [{"shot_id": "shot-0", "source_frame": 0}, {"shot_id": "shot-1", "source_frame": 2}], "shot_ranges": {"shot-0": [0, 2], "shot-1": [2, 4]}},
+    ]}), encoding="utf-8")
+    output = tmp_path / "batch-output"
+    assert main(["batch", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--tracker", "iou", "--play-alignment", str(alignment)]) == 0
+    report = json.loads((output / "batch.json").read_text(encoding="utf-8"))
+    assert report["status"] == "complete_with_unresolved"
+    assert [item["play_id"] for item in report["plays"]] == ["p1", "p2"]
+    assert all(item["promotion_gate_status"] == "not_evaluated" for item in report["plays"])
+    assert all((output / play / "identity-links.json").is_file() for play in ("p1", "p2"))
+
+
+def test_batch_preserves_declared_shot_ids_when_window_starts_after_frame_zero(tmp_path) -> None:
+    input_path = tmp_path / "later-batch.mp4"
+    make_video(input_path)
+    alignment = tmp_path / "later-alignments.json"
+    alignment.write_text(json.dumps({"reviewed": True, "plays": [
+        {"play_id": "p-later", "anchors": [{"shot_id": "shot-2", "source_frame": 2}, {"shot_id": "shot-3", "source_frame": 3}], "shot_ranges": {"shot-2": [2, 3], "shot-3": [3, 4]}},
+    ]}), encoding="utf-8")
+    output = tmp_path / "later-batch-output"
+    assert main(["batch", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--tracker", "iou", "--play-alignment", str(alignment)]) == 0
+    with (output / "p-later" / "observations.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["shot_id"] for row in rows} == {"shot-2", "shot-3"}
 
 
 def test_parser_exposes_explicit_mcbyte_mask_configuration() -> None:
@@ -62,6 +100,36 @@ def test_run_rejects_a_nonpositive_memory_budget(tmp_path) -> None:
     make_video(input_path)
 
     assert main(["run", "--input", str(input_path), "--output", str(tmp_path / "out"), "--detector", "synthetic", "--max-memory-mb", "0"]) != 0
+
+
+def test_run_rejects_calibration_source_hash_before_detection(tmp_path) -> None:
+    input_path = tmp_path / "hash-mismatch.mp4"
+    make_video(input_path)
+    calibration = tmp_path / "bad-calibration.json"
+    calibration.write_text(json.dumps({"schema_version": 2, "source_sha256": "wrong", "shots": {}}), encoding="utf-8")
+    output = tmp_path / "mismatch-output"
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--calibration", str(calibration)]) == 2
+    assert not (output / "detections.jsonl").exists()
+
+
+def test_run_rejects_reference_source_hash_before_detection(tmp_path) -> None:
+    input_path = tmp_path / "reference-hash-mismatch.mp4"
+    make_video(input_path)
+    reference = tmp_path / "bad-reference.json"
+    reference.write_text(json.dumps({"reviewed": True, "source_sha256": "wrong", "sequences": {"shot-0": {"frames": {}}}}), encoding="utf-8")
+    output = tmp_path / "reference-mismatch-output"
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--reviewed-reference", str(reference)]) == 2
+    assert not (output / "detections.jsonl").exists()
+
+
+def test_run_rejects_reviewed_split_source_hash_before_detection(tmp_path) -> None:
+    input_path = tmp_path / "split-hash-mismatch.mp4"
+    make_video(input_path)
+    splits = tmp_path / "bad-splits.json"
+    splits.write_text(json.dumps({"reviewed": True, "source_sha256": "wrong", "splits": {}}), encoding="utf-8")
+    output = tmp_path / "split-mismatch-output"
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--reviewed-splits", str(splits)]) == 2
+    assert not (output / "detections.jsonl").exists()
 
 
 def test_cache_chunks_merge_into_a_strict_complete_replay_cache(tmp_path) -> None:
@@ -197,9 +265,11 @@ def test_run_records_unresolved_shots_in_two_shot_cross_identity(tmp_path) -> No
     assert exit_code == 0
 
     report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
-    # In a two-shot scenario, unresolved_shots should be empty
+    # The legacy static file still exposes field coordinates, but it is not
+    # eligible to create a cross-shot merge without withheld validation.
     assert report.get("unresolved_shots") == []
-    assert report.get("note") == "only the first two aligned shots are resolved in this milestone"
+    assert report["status"] == "abstained"
+    assert report["reason"].startswith("legacy static calibration")
 
 
 def test_run_abstains_on_a_shared_homography_instead_of_merging_on_it(tmp_path) -> None:
@@ -271,26 +341,47 @@ def make_replay_video(path, frames_per_shot: int) -> None:
     writer.release()
 
 
+def write_validated_alignment(path, input_path, frames_per_shot: int) -> None:
+    pts = frame_pts(input_path)
+    assert len(pts) >= frames_per_shot * 2
+    values = {
+        "reviewed": True,
+        "source_sha256": sha256_file(input_path),
+        "play_id": "play-1",
+        "anchors": [
+            {"shot_id": "shot-0", "source_frame": 0, "source_pts": pts[0], "play_time_s": 0.0, "event": "snap"},
+            {"shot_id": "shot-1", "source_frame": frames_per_shot, "source_pts": pts[frames_per_shot], "play_time_s": 0.0, "event": "snap"},
+        ],
+        "correspondences": [
+            {"shot_id": "shot-0", "source_pts": pts[frames_per_shot - 1], "play_time_s": (frames_per_shot - 1) / 10.0, "event": "contact"},
+            {"shot_id": "shot-1", "source_pts": pts[frames_per_shot * 2 - 1], "play_time_s": (frames_per_shot - 1) / 10.0, "event": "contact"},
+        ],
+        "validation_correspondences": [
+            {"shot_id": "shot-0", "source_pts": pts[3], "play_time_s": 0.3, "event": "release"},
+            {"shot_id": "shot-1", "source_pts": pts[frames_per_shot + 3], "play_time_s": 0.3, "event": "release"},
+        ],
+    }
+    path.write_text(json.dumps(values), encoding="utf-8")
+
+
 def test_run_reaches_a_resolved_cross_shot_outcome_from_view_invariant_evidence(tmp_path) -> None:
     frames_per_shot = 7
     input_path = tmp_path / "replay.mp4"
     make_replay_video(input_path, frames_per_shot)
 
     alignment = tmp_path / "alignment.json"
-    alignment.write_text(json.dumps({
-        "reviewed": True, "play_id": "play-1",
-        "anchors": [
-            {"shot_id": "shot-0", "source_frame": 0, "event": "snap"},
-            {"shot_id": "shot-1", "source_frame": frames_per_shot, "event": "snap"},
-        ],
-    }), encoding="utf-8")
+    write_validated_alignment(alignment, input_path, frames_per_shot)
 
     landmarks = {
         "image_points": [[0, 0], [REPLAY_WIDTH, 0], [REPLAY_WIDTH, REPLAY_HEIGHT], [0, REPLAY_HEIGHT]],
         "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
+        "withheld_image_points": [[REPLAY_WIDTH / 2, REPLAY_HEIGHT / 2]],
+        "withheld_field_points": [[60, 26.665]],
+        "pts_start": 0,
+        "pts_end": 100000,
     }
     calibration = tmp_path / "calibration.json"
-    calibration.write_text(json.dumps({"shots": {"shot-0": landmarks, "shot-1": landmarks}}), encoding="utf-8")
+    calibration.write_text(json.dumps({"schema_version": 2, "source_sha256": sha256_file(input_path), "shots": {"shot-0": {"keyframes": [landmarks]}, "shot-1": {"keyframes": [landmarks]}}}), encoding="utf-8")
 
     # Forces real (non-"unknown") team labels onto the synthetic fixture's crops,
     # which is required for cross_shot_candidate_scores to consider a pair at all.
@@ -331,7 +422,7 @@ def test_run_accepts_pts_scoped_calibration_timeline(tmp_path) -> None:
     input_path = tmp_path / "replay-timeline.mp4"
     make_replay_video(input_path, frames_per_shot)
     alignment = tmp_path / "alignment.json"
-    alignment.write_text(json.dumps({"reviewed": True, "play_id": "play-1", "anchors": [{"shot_id": "shot-0", "source_frame": 0}, {"shot_id": "shot-1", "source_frame": frames_per_shot}]}), encoding="utf-8")
+    write_validated_alignment(alignment, input_path, frames_per_shot)
     base = {
         "image_points": [[0, 0], [REPLAY_WIDTH, 0], [REPLAY_WIDTH, REPLAY_HEIGHT], [0, REPLAY_HEIGHT]],
         "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
@@ -341,7 +432,7 @@ def test_run_accepts_pts_scoped_calibration_timeline(tmp_path) -> None:
         "pts_end": 100000,
     }
     calibration = tmp_path / "calibration-timeline.json"
-    calibration.write_text(json.dumps({"schema_version": 2, "shots": {"shot-0": {"keyframes": [base]}, "shot-1": {"keyframes": [base]}}}), encoding="utf-8")
+    calibration.write_text(json.dumps({"schema_version": 2, "source_sha256": sha256_file(input_path), "shots": {"shot-0": {"keyframes": [base]}, "shot-1": {"keyframes": [base]}}}), encoding="utf-8")
     prototypes = tmp_path / "prototypes.json"
     prototypes.write_text(json.dumps({"blue": [0.0, 0.0, 1.0], "green": [0.0, 1.0, 0.0]}), encoding="utf-8")
     output = tmp_path / "timeline-run"
@@ -367,3 +458,71 @@ def test_analysis_identity_includes_calibration_provenance(tmp_path) -> None:
     first = json.loads((first_output / "run-manifest.json").read_text(encoding="utf-8"))
     second = json.loads((second_output / "run-manifest.json").read_text(encoding="utf-8"))
     assert first["config_hash"] != second["config_hash"]
+    config = json.loads((first_output / "analysis-config.json").read_text(encoding="utf-8"))
+    assert config["schema_version"] == 2
+    assert config["analysis_hash"] == first["config_hash"]
+    assert config["source_sha256"] == first["input_sha256"]
+
+
+def test_run_supports_bounded_source_windows_and_records_scope(tmp_path) -> None:
+    input_path = tmp_path / "window.mp4"
+    make_video(input_path)
+    output = tmp_path / "window-run"
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--tracker", "iou", "--start-frame", "1", "--end-frame", "3"]) == 0
+    metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["window"] == {"start_frame": 1, "end_frame": 3, "processed_frame_count": 2, "source_frame_count": 4}
+    with (output / "observations.csv").open(newline="") as handle:
+        assert {int(row["frame_index"]) for row in csv.DictReader(handle)} == {1, 2}
+    capture = cv2.VideoCapture(str(output / "annotated.mp4"))
+    count = 0
+    while capture.read()[0]:
+        count += 1
+    capture.release()
+    assert count == 2
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--tracker", "iou", "--start-frame", "0", "--end-frame", "4"]) == 0
+    rerun_metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+    assert rerun_metrics["detection_cache_hit"] is False
+
+
+def test_run_promotes_only_a_complete_reviewed_synthetic_fixture(tmp_path) -> None:
+    import pytest
+
+    pytest.importorskip("trackeval")
+    frames_per_shot = 7
+    input_path = tmp_path / "promoted.mp4"
+    make_replay_video(input_path, frames_per_shot)
+    alignment = tmp_path / "alignment.json"
+    write_validated_alignment(alignment, input_path, frames_per_shot)
+    calibration_config = {
+        "image_points": [[0, 0], [REPLAY_WIDTH, 0], [REPLAY_WIDTH, REPLAY_HEIGHT], [0, REPLAY_HEIGHT]],
+        "field_points": [[0, 0], [120, 0], [120, 53.33], [0, 53.33]],
+        "withheld_image_points": [[REPLAY_WIDTH / 2, REPLAY_HEIGHT / 2]],
+        "withheld_field_points": [[60, 26.665]],
+        "pts_start": 0,
+        "pts_end": 100000,
+    }
+    calibration = tmp_path / "calibration.json"
+    calibration.write_text(json.dumps({"schema_version": 2, "source_sha256": sha256_file(input_path), "shots": {"shot-0": {"keyframes": [calibration_config]}, "shot-1": {"keyframes": [calibration_config]}}}), encoding="utf-8")
+    prototypes = tmp_path / "prototypes.json"
+    prototypes.write_text(json.dumps({"blue": [0.0, 0.0, 1.0], "green": [0.0, 1.0, 0.0]}), encoding="utf-8")
+    boxes = [[10.0, 12.0, 18.0, 46.8], [62.0, 10.8, 70.0, 45.6]]
+    sequences = {}
+    for shot_id, start in (("shot-0", 0), ("shot-1", frames_per_shot)):
+        frames = {}
+        for index in range(frames_per_shot):
+            frames[str(start + index)] = {"labeled": True, "objects": [
+                {"id": "p1" if shot_id == "shot-0" else "q1", "bbox_xyxy": boxes[0], "ground_contact_xy_yards": [16.8, 41.6], "team": "blue"},
+                {"id": "p2" if shot_id == "shot-0" else "q2", "bbox_xyxy": boxes[1], "ground_contact_xy_yards": [79.2, 40.5], "team": "green"},
+            ]}
+        sequences[shot_id] = {"frames": frames}
+    reference = tmp_path / "reference.json"
+    reference.write_text(json.dumps({"reviewed": True, "source_sha256": sha256_file(input_path), "sequences": sequences, "cross_shot_identity": {"shot-0": {"p1": "A", "p2": "B"}, "shot-1": {"q1": "A", "q2": "B"}}}), encoding="utf-8")
+    output = tmp_path / "promoted-run"
+    assert main(["run", "--input", str(input_path), "--output", str(output), "--detector", "synthetic", "--tracker", "iou", "--manual-cut", str(frames_per_shot), "--play-alignment", str(alignment), "--calibration", str(calibration), "--team-prototypes", str(prototypes), "--reviewed-reference", str(reference)]) == 0
+    evaluation = json.loads((output / "tracking-evaluation.json").read_text(encoding="utf-8"))
+    assert evaluation["promotion_gate"]["status"] == "not_evaluated"
+    assert "proxy detector" in evaluation["promotion_gate"]["reasons"][0]
+    assert evaluation["cross_shot"]["false_merges"] == 0
+    assert evaluation["ground_contact"]["gate"]["valid_fraction_at_least_0_90"] is True
+    artifact_validation = json.loads((output / "artifact-validation.json").read_text(encoding="utf-8"))
+    assert artifact_validation["status"] == "valid"

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from football_tracking.annotations import AnnotationError, load_annotation_manifest, source_bbox_from_crop
+from football_tracking.annotations import AnnotationError, load_annotation_manifest, manifest_template_from_review_pack, source_bbox_from_crop
 
 
 def source() -> dict:
@@ -16,8 +16,8 @@ def manifest(**updates) -> dict:
         "schema_version": 1,
         "reviewed": True,
         "source": source(),
-        "shots": {"shot-0": {"start_frame": 0, "end_frame": 10, "play_id": "p1", "split": "development"}},
-        "annotations": [{"id": "a", "shot_id": "shot-0", "source_frame": 2, "bbox_xyxy_px": [1, 2, 10, 20], "review_status": "reviewed", "coordinate_space": "source"}],
+        "shots": {"shot-0": {"start_frame": 0, "end_frame": 10, "play_id": "p1", "split": "development", "camera_label": "sideline"}},
+        "annotations": [{"id": "a", "shot_id": "shot-0", "source_frame": 2, "pts": 120, "bbox_xyxy_px": [1, 2, 10, 20], "review_status": "reviewed", "coordinate_space": "source", "reviewer": "reviewer-1", "revision": 1, "reviewed_at": "2026-09-15T00:00:00Z", "annotation_confidence": 1.0}],
     }
     value.update(updates)
     return value
@@ -37,6 +37,15 @@ def test_load_annotation_manifest_validates_source_and_review_state(tmp_path) ->
     unreviewed = manifest(reviewed=False)
     with pytest.raises(AnnotationError, match="reviewed"):
         load_annotation_manifest(write(tmp_path, unreviewed), "abc")
+    missing_pts = manifest(annotations=[{key: value for key, value in manifest()["annotations"][0].items() if key != "pts"}])
+    with pytest.raises(AnnotationError, match="pts"):
+        load_annotation_manifest(write(tmp_path, missing_pts), "abc")
+    missing_reviewer = manifest(annotations=[{key: value for key, value in manifest()["annotations"][0].items() if key != "reviewer"}])
+    with pytest.raises(AnnotationError, match="reviewer"):
+        load_annotation_manifest(write(tmp_path, missing_reviewer), "abc")
+    bad_timestamp = manifest(annotations=[{**manifest()["annotations"][0], "reviewed_at": "yesterday"}])
+    with pytest.raises(AnnotationError, match="ISO-8601"):
+        load_annotation_manifest(write(tmp_path, bad_timestamp), "abc")
 
 
 def test_load_annotation_manifest_rejects_duplicates_bounds_and_split_conflicts(tmp_path) -> None:
@@ -46,7 +55,7 @@ def test_load_annotation_manifest_rejects_duplicates_bounds_and_split_conflicts(
     out_of_shot = manifest(annotations=[{**manifest()["annotations"][0], "source_frame": 20}])
     with pytest.raises(AnnotationError, match="outside"):
         load_annotation_manifest(write(tmp_path, out_of_shot), "abc")
-    conflict = manifest(shots={"shot-0": {"start_frame": 0, "end_frame": 10, "play_id": "p1", "split": "development"}, "shot-1": {"start_frame": 10, "end_frame": 20, "play_id": "p1", "split": "test"}})
+    conflict = manifest(shots={"shot-0": {"start_frame": 0, "end_frame": 10, "play_id": "p1", "split": "development", "camera_label": "sideline"}, "shot-1": {"start_frame": 10, "end_frame": 20, "play_id": "p1", "split": "test", "camera_label": "endzone"}})
     with pytest.raises(AnnotationError, match="conflicting"):
         load_annotation_manifest(write(tmp_path, conflict), "abc")
 
@@ -56,9 +65,17 @@ def test_source_bbox_from_crop_round_trips_resized_coordinates() -> None:
 
 
 def test_load_annotation_manifest_validates_fit_and_withheld_landmarks(tmp_path) -> None:
-    value = manifest(landmarks=[{"id": "yardline-20-near", "shot_id": "shot-0", "source_frame": 2, "image_xy_px": [100, 200], "field_xy_yards": [20, 0], "role": "fit", "review_status": "reviewed"}])
+    value = manifest(landmarks=[{"id": "yardline-20-near", "shot_id": "shot-0", "source_frame": 2, "pts": 120, "image_xy_px": [100, 200], "field_xy_yards": [20, 0], "role": "fit", "review_status": "reviewed", "reviewer": "reviewer-1", "revision": 1, "reviewed_at": "2026-09-15T00:00:00Z", "annotation_confidence": 1.0}])
     parsed = load_annotation_manifest(write(tmp_path, value), "abc")
     assert parsed.landmarks[0]["role"] == "fit"
-    invalid = manifest(landmarks=[{"id": "bad", "shot_id": "shot-0", "source_frame": 2, "image_xy_px": [100, 200], "field_xy_yards": [20, 0], "role": "fit", "review_status": "unreviewed"}])
+    invalid = manifest(landmarks=[{"id": "bad", "shot_id": "shot-0", "source_frame": 2, "pts": 120, "image_xy_px": [100, 200], "field_xy_yards": [20, 0], "role": "fit", "review_status": "unreviewed", "reviewer": "reviewer-1", "revision": 1, "reviewed_at": "2026-09-15T00:00:00Z", "annotation_confidence": 1.0}])
     with pytest.raises(AnnotationError, match="not reviewed"):
         load_annotation_manifest(write(tmp_path, invalid), "abc")
+
+
+def test_manifest_template_preserves_review_pack_source_and_frame_records() -> None:
+    pack = {"schema_version": 1, "reviewed": False, "source": source(), "frames": [{"source_frame": 2, "pts": 120}]}
+    template = manifest_template_from_review_pack(pack, {"shot-0": {"start_frame": 0, "end_frame": 10, "camera_label": "sideline"}})
+    assert template["reviewed"] is False
+    assert template["source"]["sha256"] == "abc"
+    assert template["review_frames"][0]["pts"] == 120

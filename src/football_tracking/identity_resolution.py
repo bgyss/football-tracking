@@ -8,7 +8,7 @@ from itertools import combinations
 from typing import Any, Mapping, Sequence
 
 from .identity import IdentityLink, TeamEvidence, match_tracklets, stable_anonymous_ids
-from .replay import FieldTrack, cross_shot_candidate_scores
+from .replay import FieldTrack, cross_shot_candidate_evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,11 +19,12 @@ class ResolutionPolicy:
     min_overlap_samples: int = 5
     sample_tolerance_s: float = 0.05
     min_overlap_duration_s: float = 0.4
+    max_position_uncertainty_yards: float = 2.0
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.threshold <= 1.0 or not math.isfinite(self.threshold) or self.margin < 0.0 or not math.isfinite(self.margin):
             raise ValueError("invalid identity resolution thresholds")
-        if self.max_field_distance_yards <= 0 or not math.isfinite(self.max_field_distance_yards) or self.min_overlap_samples < 2 or self.sample_tolerance_s <= 0 or not math.isfinite(self.sample_tolerance_s) or self.min_overlap_duration_s < 0 or not math.isfinite(self.min_overlap_duration_s):
+        if self.max_field_distance_yards <= 0 or not math.isfinite(self.max_field_distance_yards) or self.min_overlap_samples < 2 or self.sample_tolerance_s <= 0 or not math.isfinite(self.sample_tolerance_s) or self.min_overlap_duration_s < 0 or not math.isfinite(self.min_overlap_duration_s) or self.max_position_uncertainty_yards < 0 or not math.isfinite(self.max_position_uncertainty_yards):
             raise ValueError("invalid identity resolution evidence limits")
 
 
@@ -39,6 +40,8 @@ class PlayResolution:
     reason: str | None = None
     candidate_scores: tuple[tuple[str, str, float], ...] = ()
     failed_pairs: tuple[tuple[str, str], ...] = ()
+    unmatched_tracklets: tuple[str, ...] = ()
+    candidate_evidence: tuple[dict[str, object], ...] = ()
 
     @property
     def accepted_links(self) -> tuple[IdentityLink, ...]:
@@ -53,7 +56,9 @@ class PlayResolution:
             "unresolved_shots": list(self.unresolved_shots),
             "candidate_pairs": self.candidate_pairs,
             "candidate_scores": [{"left_key": left, "right_key": right, "score": score} for left, right, score in self.candidate_scores],
+            "candidate_evidence": [dict(record) for record in self.candidate_evidence],
             "failed_pairs": [{"left_shot": left, "right_shot": right} for left, right in self.failed_pairs],
+            "unmatched_tracklets": list(self.unmatched_tracklets),
             "accepted_links": len(self.accepted_links),
             "links": [
                 {
@@ -71,13 +76,27 @@ class PlayResolution:
         }
 
 
-def _safe_component_links(tracklet_ids: Sequence[str], links: Sequence[IdentityLink]) -> tuple[list[IdentityLink], list[IdentityLink]]:
+def _safe_component_links(
+    tracklet_ids: Sequence[str],
+    links: Sequence[IdentityLink],
+    tracklet_teams: Mapping[str, str] | None = None,
+    tracklet_frames: Mapping[str, Sequence[int]] | None = None,
+    tracklet_play_ids: Mapping[str, str | None] | None = None,
+    tracklet_jerseys: Mapping[str, Sequence[int]] | None = None,
+) -> tuple[list[IdentityLink], list[IdentityLink]]:
     accepted: list[IdentityLink] = []
     rejected: list[IdentityLink] = []
     for link in sorted((item for item in links if item.decision == "same"), key=lambda item: (item.left_key, item.right_key or "")):
         candidate = accepted + [link]
         try:
-            stable_anonymous_ids(tracklet_ids, candidate)
+            stable_anonymous_ids(
+                tracklet_ids,
+                candidate,
+                tracklet_frames=tracklet_frames,
+                tracklet_play_ids=tracklet_play_ids,
+                tracklet_teams=tracklet_teams,
+                tracklet_jerseys=tracklet_jerseys,
+            )
         except ValueError:
             rejected.append(IdentityLink(link.left_key, link.right_key, "insufficient_evidence", link.score, link.evidence_keys, link.alternative_score, link.ambiguity_margin, "component_conflict"))
         else:
@@ -92,13 +111,18 @@ def resolve_play_identities(
     time_map: Any = None,
     teams: Mapping[str, TeamEvidence] | None = None,
     policy: ResolutionPolicy | None = None,
+    tracklet_frames: Mapping[str, Sequence[int]] | None = None,
+    tracklet_play_ids: Mapping[str, str | None] | None = None,
+    tracklet_jerseys: Mapping[str, Sequence[int]] | None = None,
 ) -> PlayResolution:
     """Resolve all shot pairs in one reviewed play.
 
     ``segments`` must already contain calibrated, play-time samples. The
     calibration and time_map parameters are retained in the public interface
     for callers that need to attach their provenance; this function never uses
-    raw image coordinates or silently extrapolates either input.
+    raw image coordinates or silently extrapolates either input. When supplied,
+    ``tracklet_frames`` allows component checks to distinguish reviewed,
+    non-overlapping fragments from simultaneous same-shot tracks.
     """
 
     del calibration, time_map
@@ -111,15 +135,17 @@ def resolve_play_identities(
     present = [shot_id for shot_id in shot_ids if segments.get(shot_id)]
     unresolved = [shot_id for shot_id in shot_ids if not segments.get(shot_id)]
     if len(present) < 2:
-        return PlayResolution(play_id, "abstained", (), 0, shot_ids, tuple(unresolved or shot_ids), reason="fewer than two shots have calibrated field tracks")
+        unmatched = tuple(sorted(track.tracklet_id for shot_id in present for track in segments[shot_id]))
+        return PlayResolution(play_id, "abstained", (), 0, shot_ids, tuple(unresolved or shot_ids), reason="fewer than two shots have calibrated field tracks", unmatched_tracklets=unmatched)
     all_links: list[IdentityLink] = []
     candidate_count = 0
     candidate_records: list[tuple[str, str, float]] = []
+    candidate_evidence_records: list[dict[str, object]] = []
     failed_pairs: list[tuple[str, str]] = []
     for left_shot, right_shot in combinations(present, 2):
         left = list(segments[left_shot])
         right = list(segments[right_shot])
-        candidates = cross_shot_candidate_scores(
+        evidence = cross_shot_candidate_evidence(
             left,
             right,
             teams,
@@ -127,9 +153,15 @@ def resolve_play_identities(
             min_overlap_samples=selected_policy.min_overlap_samples,
             sample_tolerance_s=selected_policy.sample_tolerance_s,
             min_overlap_duration_s=selected_policy.min_overlap_duration_s,
+            max_position_uncertainty_yards=selected_policy.max_position_uncertainty_yards,
         )
+        candidates = {key: float(record["score"]) for key, record in evidence.items() if record["eligible"] and record["score"] is not None}
         candidate_count += len(candidates)
         candidate_records.extend((left_key, right_key, float(score)) for (left_key, right_key), score in sorted(candidates.items()))
+        candidate_evidence_records.extend(
+            {**record, "pair_left_shot": left_shot, "pair_right_shot": right_shot}
+            for _, record in sorted(evidence.items())
+        )
         pair_links = match_tracklets(
             [track.tracklet_id for track in left],
             [track.tracklet_id for track in right],
@@ -147,7 +179,15 @@ def resolve_play_identities(
         # calibration or no valid field samples), so a two-shot abstention
         # remains distinguishable from a missing view.
     tracklet_ids = [track.tracklet_id for shot_id in present for track in segments[shot_id]]
-    accepted, rejected = _safe_component_links(tracklet_ids, all_links)
+    tracklet_teams = {tracklet_id: evidence.team for tracklet_id, evidence in teams.items()}
+    accepted, rejected = _safe_component_links(
+        tracklet_ids,
+        all_links,
+        tracklet_teams,
+        tracklet_frames,
+        tracklet_play_ids,
+        tracklet_jerseys,
+    )
     # Keep one deterministic link record per left/right pair, preferring an
     # accepted edge and then the highest score.
     chosen: dict[tuple[str, str | None], IdentityLink] = {}
@@ -161,10 +201,12 @@ def resolve_play_identities(
         for left_shot, right_shot in failed_pairs:
             unresolved.extend((left_shot, right_shot))
     unresolved_shots = tuple(sorted(set(unresolved)))
-    if accepted and not unresolved_shots and not rejected:
+    linked_tracklets = {link.left_key for link in accepted} | {link.right_key for link in accepted if link.right_key is not None}
+    unmatched_tracklets = tuple(sorted(set(tracklet_ids) - linked_tracklets))
+    if accepted and not unresolved_shots and not rejected and not unmatched_tracklets:
         status, reason = "resolved", "all present shot pairs cleared the reviewed policy"
     elif accepted:
         status, reason = "partially_resolved", "some aligned shots or segments lacked an eligible link"
     else:
         status, reason = "abstained", "no candidate pair cleared the reviewed policy"
-    return PlayResolution(play_id, status, tuple(final_links), candidate_count, shot_ids, unresolved_shots, tuple(rejected), reason, tuple(candidate_records), tuple(sorted(failed_pairs)))
+    return PlayResolution(play_id, status, tuple(final_links), candidate_count, shot_ids, unresolved_shots, tuple(rejected), reason, tuple(candidate_records), tuple(sorted(failed_pairs)), unmatched_tracklets, tuple(candidate_evidence_records))

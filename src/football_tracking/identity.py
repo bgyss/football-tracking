@@ -16,10 +16,14 @@ class TeamEvidence:
     score: float
     source: str
     crop_count: int
-    assignment_coverage: float = 0.0
+    assignment_coverage: float = 1.0
     ambiguity: float = 0.0
 
     def __post_init__(self) -> None:
+        if not self.team:
+            raise ValueError("team evidence needs a team label")
+        if not self.source:
+            raise ValueError("team evidence needs a source")
         if not 0.0 <= self.score <= 1.0:
             raise ValueError("team score must be between 0 and 1")
         if self.crop_count < 0:
@@ -31,7 +35,11 @@ class TeamEvidence:
 
     @property
     def eligible(self) -> bool:
-        return self.team != "unknown" and self.score > 0.0 and self.ambiguity < 0.5
+        # Unsupervised RGB clusters are useful diagnostics for local review,
+        # but their numeric labels are not stable across camera views. Only
+        # named/reviewed prototypes can be used as a cross-shot compatibility
+        # constraint.
+        return self.source in {"rgb_prototype", "reviewed"} and self.team != "unknown" and self.score > 0.0 and self.assignment_coverage > 0.0 and self.ambiguity < 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,11 +69,11 @@ class IdentityLink:
     def __post_init__(self) -> None:
         if self.decision not in {"same", "different", "insufficient_evidence"}:
             raise ValueError("unsupported identity decision")
-        if not 0.0 <= self.score <= 1.0:
+        if not np.isfinite(self.score) or not 0.0 <= self.score <= 1.0:
             raise ValueError("identity score must be between 0 and 1")
-        if self.alternative_score is not None and not 0.0 <= self.alternative_score <= 1.0:
+        if self.alternative_score is not None and (not np.isfinite(self.alternative_score) or not 0.0 <= self.alternative_score <= 1.0):
             raise ValueError("alternative score must be between 0 and 1")
-        if self.ambiguity_margin is not None and self.ambiguity_margin < 0.0:
+        if self.ambiguity_margin is not None and (not np.isfinite(self.ambiguity_margin) or self.ambiguity_margin < 0.0):
             raise ValueError("ambiguity margin must be non-negative")
         if self.decision == "same" and self.right_key is None:
             raise ValueError("same links require a right key")
@@ -74,7 +82,7 @@ class IdentityLink:
 def team_feature_from_crop(crop_bgr: np.ndarray) -> tuple[float, float, float] | None:
     """Return a robust torso RGB mean, or None for an unusable crop."""
 
-    if crop_bgr.ndim != 3 or crop_bgr.shape[2] != 3 or crop_bgr.shape[0] < 4 or crop_bgr.shape[1] < 4:
+    if crop_bgr.ndim != 3 or crop_bgr.shape[2] != 3 or crop_bgr.shape[0] < 4 or crop_bgr.shape[1] < 4 or not np.all(np.isfinite(crop_bgr)):
         return None
     height, width = crop_bgr.shape[:2]
     torso = crop_bgr[int(height * 0.2) : int(height * 0.8), int(width * 0.2) : int(width * 0.8)]
@@ -121,11 +129,11 @@ def resolve_teams(
     if prototypes:
         names = sorted(prototypes)
         centers = np.asarray([prototypes[name] for name in names], dtype=float)
-        if centers.ndim != 2 or centers.shape[1] != 3:
+        if centers.ndim != 2 or centers.shape[1] != 3 or not np.all(np.isfinite(centers)) or np.any(centers < 0.0) or np.any(centers > 1.0):
             raise ValueError("team prototypes must be RGB triples")
         for tracklet in tracklets:
             if not tracklet.team_features:
-                result[tracklet.tracklet_id] = TeamEvidence("unknown", 0.0, "no_crops", 0)
+                result[tracklet.tracklet_id] = TeamEvidence("unknown", 0.0, "no_crops", 0, 0.0)
                 continue
             features = np.asarray(tracklet.team_features, dtype=float)
             distances = np.linalg.norm(features[:, None, :] - centers[None, :, :], axis=2)
@@ -148,11 +156,11 @@ def resolve_teams(
         return result
     all_features = [feature for tracklet in tracklets for feature in tracklet.team_features]
     if not all_features:
-        return {tracklet.tracklet_id: TeamEvidence("unknown", 0.0, "no_crops", 0) for tracklet in tracklets}
+        return {tracklet.tracklet_id: TeamEvidence("unknown", 0.0, "no_crops", 0, 0.0) for tracklet in tracklets}
     centers, _ = _cluster_features(np.asarray(all_features, dtype=float))
     for tracklet in tracklets:
         if not tracklet.team_features:
-            result[tracklet.tracklet_id] = TeamEvidence("unknown", 0.0, "no_crops", 0)
+            result[tracklet.tracklet_id] = TeamEvidence("unknown", 0.0, "no_crops", 0, 0.0)
             continue
         features = np.asarray(tracklet.team_features, dtype=float)
         distances = np.linalg.norm(features[:, None, :] - centers[None, :, :], axis=2)
@@ -177,7 +185,7 @@ def match_tracklets(
     left = sorted(set(left_keys))
     right = sorted(set(right_keys))
     if not left or not right:
-        return [IdentityLink(key, None, "insufficient_evidence", 0.0) for key in left]
+        return [IdentityLink(key, None, "insufficient_evidence", 0.0, rejection_reason="no_comparison_tracklets") for key in left]
     matrix = np.full((len(left), len(right)), -1.0, dtype=float)
     for i, left_key in enumerate(left):
         for j, right_key in enumerate(right):
@@ -208,7 +216,8 @@ def match_tracklets(
     for row, left_key in enumerate(left):
         column = assignment.get(row)
         if column is None or column >= len(right) or eligible[row, column] < 0:
-            links.append(IdentityLink(left_key, None, "insufficient_evidence", 0.0))
+            reason = "no_eligible_edge" if not np.any(eligible[row] >= threshold) else "unmatched_by_global_assignment"
+            links.append(IdentityLink(left_key, None, "insufficient_evidence", 0.0, rejection_reason=reason))
             continue
         score = float(eligible[row, column])
         # A genuine ambiguity is measured against the best complete assignment
@@ -245,7 +254,15 @@ def match_tracklets(
     return links
 
 
-def stable_anonymous_ids(tracklet_ids: Sequence[str], links: Sequence[IdentityLink]) -> dict[str, str]:
+def stable_anonymous_ids(
+    tracklet_ids: Sequence[str],
+    links: Sequence[IdentityLink],
+    *,
+    tracklet_frames: Mapping[str, Sequence[int]] | None = None,
+    tracklet_play_ids: Mapping[str, str | None] | None = None,
+    tracklet_teams: Mapping[str, str] | None = None,
+    tracklet_jerseys: Mapping[str, Sequence[int]] | None = None,
+) -> dict[str, str]:
     parent = {key: key for key in sorted(set(tracklet_ids))}
 
     def find(key: str) -> str:
@@ -259,10 +276,31 @@ def stable_anonymous_ids(tracklet_ids: Sequence[str], links: Sequence[IdentityLi
             raise ValueError("identity link references an unknown tracklet")
         first, second = find(left), find(right)
         if first != second:
-            first_shots = {member.split(":", 1)[0] for member in parent if find(member) == first}
-            second_shots = {member.split(":", 1)[0] for member in parent if find(member) == second}
-            if first_shots & second_shots:
-                raise ValueError("identity link would merge two tracklets from the same shot")
+            first_members = [member for member in parent if find(member) == first]
+            second_members = [member for member in parent if find(member) == second]
+            if tracklet_play_ids is not None:
+                first_plays = {tracklet_play_ids.get(member) for member in first_members} - {None}
+                second_plays = {tracklet_play_ids.get(member) for member in second_members} - {None}
+                if first_plays and second_plays and first_plays != second_plays:
+                    raise ValueError("identity link would merge tracklets from incompatible plays")
+            if tracklet_teams is not None:
+                first_teams = {tracklet_teams.get(member) for member in first_members} - {None, "unknown"}
+                second_teams = {tracklet_teams.get(member) for member in second_members} - {None, "unknown"}
+                if first_teams and second_teams and first_teams.isdisjoint(second_teams):
+                    raise ValueError("identity link would merge contradictory teams")
+            if tracklet_jerseys is not None:
+                first_numbers = {int(number) for member in first_members for number in tracklet_jerseys.get(member, ())}
+                second_numbers = {int(number) for member in second_members for number in tracklet_jerseys.get(member, ())}
+                if first_numbers and second_numbers and first_numbers.isdisjoint(second_numbers):
+                    raise ValueError("identity link would merge contradictory jersey evidence")
+            first_shots = {member.split(":", 1)[0] for member in first_members}
+            second_shots = {member.split(":", 1)[0] for member in second_members}
+            shared_shots = first_shots & second_shots
+            for shot_id in shared_shots:
+                first_same_shot = [member for member in first_members if member.split(":", 1)[0] == shot_id]
+                second_same_shot = [member for member in second_members if member.split(":", 1)[0] == shot_id]
+                if tracklet_frames is None or any(left not in tracklet_frames or right not in tracklet_frames or set(tracklet_frames[left]) & set(tracklet_frames[right]) for left in first_same_shot for right in second_same_shot):
+                    raise ValueError("identity link would merge overlapping tracklets from the same shot")
             parent[max(first, second)] = min(first, second)
 
     for link in links:

@@ -14,6 +14,7 @@ from football_tracking.export import (
     write_observations_parquet,
     write_observations_csv,
     write_trajectories_csv,
+    write_play_trajectories_csv,
 )
 from football_tracking.schema import Observation
 from football_tracking.video import ShotBoundary
@@ -84,6 +85,16 @@ def test_field_view_and_stage_timer(tmp_path) -> None:
     assert timer.timings["unit_s"] >= 0.0
 
 
+def test_calibration_export_can_carry_source_provenance(tmp_path) -> None:
+    from football_tracking.calibration import FieldPoint, Homography, ImagePoint
+    from football_tracking.export import write_calibration_json
+
+    calibration = Homography.fit([ImagePoint(0, 0), ImagePoint(100, 0), ImagePoint(100, 100), ImagePoint(0, 100)], [FieldPoint(0, 0), FieldPoint(10, 0), FieldPoint(10, 10), FieldPoint(0, 10)])
+    path = tmp_path / "calibration.json"
+    write_calibration_json(path, {"shot-0": calibration}, source_sha256="abc")
+    assert json.loads(path.read_text())["source_sha256"] == "abc"
+
+
 def test_field_view_draws_a_replay_merged_player_as_two_separate_paths(tmp_path) -> None:
     # A player observed in both shots of a correct replay merge must be drawn as two
     # independent trails, not one line joined across the cut by a spurious segment.
@@ -139,3 +150,16 @@ def test_trajectory_export_contains_pixel_positions_and_optional_field_positions
     assert parsed[0]["x_px"] == "5.0"
     assert parsed[0]["x_yards"] == "0.0"
     assert parsed[1]["x_yards"] == ""
+
+
+def test_play_trajectory_export_deduplicates_replay_bins_using_quality(tmp_path) -> None:
+    path = tmp_path / "play-trajectories.csv"
+    best = observation(0, "shot-0")
+    best = best.__class__(**{**best.to_dict(), "play_id": "play-1", "play_time_s": 0.0, "position_uncertainty_yards": 0.5})
+    duplicate = observation(0, "shot-1")
+    duplicate = duplicate.__class__(**{**duplicate.to_dict(), "play_id": "play-1", "play_time_s": 0.0, "position_uncertainty_yards": 2.0})
+    write_play_trajectories_csv(path, [duplicate, best])
+    with path.open(newline="") as handle:
+        parsed = list(csv.DictReader(handle))
+    assert len(parsed) == 1
+    assert parsed[0]["shot_id"] == "shot-0"

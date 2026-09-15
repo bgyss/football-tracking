@@ -36,7 +36,7 @@ The sample clip is 1,424 frames at 60000/1001 fps with a manually verified cut a
 ## Architecture
 
 Offline, two-pass pipeline in `src/football_tracking/`, driven entirely by `cli.py`
-(`run`, `benchmark`, `cache`, `merge-cache`). `run_pipeline` is the spine: decode →
+(`run`, `batch`, `benchmark`, `cache`, `merge-cache`). `run_pipeline` is the spine: decode →
 shot boundaries → detect (or cache hit) → per-shot track → team/identity → calibrate →
 export → evaluate → manifest.
 
@@ -60,9 +60,9 @@ export → evaluate → manifest.
 - `tracklet_refinement.py` — reviewed, immutable within-shot split overlays passed by
   `--reviewed-splits`; raw tracker rows remain unchanged.
 - `replay.py` — reviewed play-time alignment (`--play-alignment`, refuses anything not
-  explicitly marked `reviewed: true`), PTS-based maps, and cross-shot candidate scoring from
-  view-invariant evidence only (team agreement, calibrated field position at aligned
-  play time, trajectory shape). Cross-shot resolution runs when `--play-alignment`
+  explicitly marked `reviewed: true`), PTS-based maps, and auditable cross-shot candidate
+  evidence from view-invariant signals only (team agreement, calibrated field position at
+  aligned play time, trajectory shape, overlap span, and uncertainty). Cross-shot resolution runs when `--play-alignment`
   supplies reviewed snap anchors and requires genuinely shot-specific calibration for
   the two shots being resolved (a shared `"*"` homography does not qualify, since
   applying one camera pose's transform to another shot would make "field position" a
@@ -75,18 +75,33 @@ export → evaluate → manifest.
   field-only motion propagation proposals.
 - `annotations.py` / `field.py` — source-hashed reviewed annotation manifests and the
   canonical NFL field coordinate template.
+- `scripts/fit_calibration_timeline.py` — convert a reviewed annotation manifest into the
+  schema-v2 PTS-scoped calibration artifact.
+- `scripts/build_annotation_manifest.py` — create an unreviewed manifest template from the
+  extracted full-game review pack.
+- `scripts/build_play_inventory.py` — scan long recordings into unreviewed candidate shot
+  intervals for play grouping and calibration review.
 - `evaluation.py` — reviewed MOT-style reference import and HOTA/IDF1-style metrics.
   Without `--reviewed-reference`, `tracking-evaluation.json` says `not_evaluated`.
 - `memory.py` — `MemoryBudget`, a peak-RSS guard (default 2048 MiB) sampled at stage
   boundaries; on macOS the hard limit cannot be enforced before McByte mask
   construction, which is why `--allow-unbounded-memory` exists.
+- `run --start-frame/--end-frame` — bounded source windows for long recordings; window
+  scope is recorded and partial detector caches are never assumed to cover other windows.
+  Bounded CFR windows use a declared PTS/frame step; full passes retain ffprobe PTS.
+  Multi-play alignment manifests require explicit `--play-id` selection.
+- `batch` — runs each reviewed alignment-set play with declared `shot_ranges` in its own
+  bounded output directory and emits `batch.json`; it reports `complete_with_unresolved`
+  when execution finished but a child identity/evaluation gate remains open, and only
+  reports `complete` when every child promotion gate passes.
 - `schema.py` — `Observation` / `RunManifest` frozen dataclasses with validating
   `__post_init__`. These are the stable contract; `export.py` writers follow it.
 
 Each `run` writes a fixed artifact set to `--output`: `annotated.mp4`,
-`observations.csv`/`.parquet`, `trajectories.csv`, `identities.json`, `field-view.png`,
-`shots.json`, `calibration.json`, `identity-links.json`, `review.json`,
-`tracking-evaluation.json`, `metrics.json`, `run-manifest.json`, `detections.jsonl`.
+`observations.csv`/`.parquet`, `trajectories.csv`, `play-trajectories.csv`, `identities.json`, `field-view.png`,
+`shots.json`, `calibration.json`, `calibration-quality.json`, `identity-links.json`,
+`analysis-config.json`, `review.json`, `tracklet-refinement.json`, `tracking-evaluation.json`, `metrics.json`, `artifact-validation.json`, `run-manifest.json`,
+`detections.jsonl`.
 
 ## Project conventions
 

@@ -22,6 +22,8 @@ class TrackObservation:
 
     def __post_init__(self) -> None:
         x1, y1, x2, y2 = self.bbox_xyxy_px
+        if any(not np.isfinite(float(value)) for value in self.bbox_xyxy_px):
+            raise ValueError("track box coordinates must be finite")
         if x2 <= x1 or y2 <= y1:
             raise ValueError("track box must have positive width and height")
         if self.frame_index < 0 or self.pts < 0:

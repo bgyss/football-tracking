@@ -47,6 +47,8 @@ class Observation:
 
     def __post_init__(self) -> None:
         x1, y1, x2, y2 = self.bbox_xyxy_px
+        if any(not math.isfinite(float(value)) for value in self.bbox_xyxy_px):
+            raise ValueError("bbox coordinates must be finite")
         if x2 <= x1 or y2 <= y1:
             raise ValueError("bbox must have positive width and height")
         if self.frame_index < 0:
@@ -73,6 +75,8 @@ class Observation:
             raise ValueError("position_uncertainty_yards must be finite")
         if self.play_time_s is not None and not math.isfinite(float(self.play_time_s)):
             raise ValueError("play_time_s must be finite")
+        if self.calibration_status is not None and self.calibration_status not in {"not_provided", "unvalidated", "valid", "partial", "invalid"}:
+            raise ValueError("unsupported calibration_status")
 
     def to_dict(self) -> dict[str, Any]:
         return _json_safe(asdict(self))

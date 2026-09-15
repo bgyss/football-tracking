@@ -13,20 +13,21 @@ from typing import Any, Sequence
 import numpy as np
 
 from .cache import CacheMismatch, DetectionCache
-from .calibration import Homography, load_calibrations, project_observation
-from .calibration_timeline import CalibrationTimeline, load_calibration_timeline
+from .calibration import Homography, calibration_quality_report, load_calibrations, project_observation
+from .calibration_timeline import CalibrationTimeline, load_calibration_timeline, timeline_quality_report
 from .detector import Detection, RFDETRDetector, SyntheticDetector
-from .export import StageTimer, render_annotated_video, write_calibration_json, write_field_view, write_identities_json, write_manifest_json, write_metrics_json, write_observations_csv, write_observations_parquet, write_review_json, write_trajectories_csv
+from .export import StageTimer, render_annotated_video, write_calibration_json, write_field_view, write_identities_json, write_manifest_json, write_metrics_json, write_observations_csv, write_observations_parquet, write_play_trajectories_csv, write_review_json, write_trajectories_csv
 from .identity import IdentityLink, TrackletSummary, resolve_teams, stable_anonymous_ids, team_feature_from_crop
 from .identity_resolution import ResolutionPolicy, resolve_play_identities
-from .tracklet_refinement import refine_tracklets
-from .evaluation import EvaluationError, evaluate_cross_shot_identity, evaluate_tracking, load_cross_shot_identity, load_reviewed_mot_reference
+from .tracklet_refinement import refine_tracklets, tracklet_conflict_report
+from .evaluation import EvaluationError, evaluate_cross_shot_identity, evaluate_ground_contact_positions, evaluate_promotion_gates, evaluate_team_assignment, evaluate_tracking, load_cross_shot_identity, load_reviewed_mot_reference, restrict_reference_to_window
 from .metrics import config_hash, package_version, sha256_file, summarize_tracks, system_info
 from .memory import MemoryBudget
-from .replay import FieldTrack, PlayAlignment, ReplayAlignmentError, load_play_alignment
+from .replay import FieldTrack, PlayAlignment, ReplayAlignmentError, load_play_alignment, load_play_alignments
 from .schema import Observation, RunManifest
 from .tracking import IoUTracker, McByteTracker, RoboflowTracker, TrackObservation, TrackerAdapter
-from .video import ShotBoundary, VideoInfo, detect_shots, iter_video_frames, shot_ranges
+from .video import ShotBoundary, VideoInfo, iter_video_frames, scene_change_score, shot_ranges
+from .validation import validate_run_artifacts
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark = subparsers.add_parser("benchmark", help="run local decode, detector, tracker and export benchmarks")
     _add_run_arguments(benchmark)
     benchmark.add_argument("--model-frames", type=int, default=16, help="maximum frames for an optional real detector timing probe")
+    batch = subparsers.add_parser("batch", help="run each reviewed play alignment in a bounded output directory")
+    _add_run_arguments(batch)
+    batch._option_string_actions["--play-alignment"].required = True
     cache = subparsers.add_parser("cache", help="build a bounded native-frame detector-cache chunk")
     _add_cache_arguments(cache)
     merge = subparsers.add_parser("merge-cache", help="strictly merge detector-cache chunks into a full replay cache")
@@ -68,11 +72,13 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--team-prototypes", type=Path, default=None, help="JSON object mapping team names to RGB triples")
     parser.add_argument("--calibration", type=Path, default=None, help="legacy landmark JSON or schema-v2 PTS-scoped calibration timeline")
     parser.add_argument("--play-alignment", type=Path, default=None, help="reviewed snap-anchor JSON enabling constrained cross-shot identity joins")
+    parser.add_argument("--play-id", type=str, default=None, help="select one play from a multi-play alignment manifest")
     parser.add_argument("--reviewed-splits", type=Path, default=None, help="reviewed split overlay JSON for within-shot tracklet purity")
     parser.add_argument("--identity-threshold", type=float, default=0.65, help="minimum cross-shot identity score")
     parser.add_argument("--identity-margin", type=float, default=0.1, help="minimum global assignment ambiguity margin")
     parser.add_argument("--identity-max-distance-yards", type=float, default=6.0, help="maximum robust field distance for a candidate")
     parser.add_argument("--identity-min-overlap-duration-s", type=float, default=0.4, help="minimum aligned temporal support for a candidate")
+    parser.add_argument("--identity-max-position-uncertainty-yards", type=float, default=2.0, help="maximum median combined calibration/contact uncertainty")
     parser.add_argument("--start-frame", type=int, default=0, help="inclusive source-frame start for a bounded analysis window")
     parser.add_argument("--end-frame", type=int, default=None, help="exclusive source-frame end for a bounded analysis window")
 
@@ -91,24 +97,47 @@ def _add_cache_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--end-frame", type=int, default=None, help="exclusive source-frame end for a cache chunk")
 
 
-def _boundaries_for_video(info: VideoInfo, manual_cuts: Sequence[int]) -> list[ShotBoundary]:
+def _boundaries_for_video(info: VideoInfo, manual_cuts: Sequence[int], *, scene_threshold: float = 0.28) -> list[ShotBoundary]:
+    if not np.isfinite(scene_threshold) or scene_threshold <= 0:
+        raise ValueError("scene_threshold must be positive and finite")
     cuts = sorted({int(cut) for cut in manual_cuts if 0 < int(cut) < info.frame_count})
     if cuts:
         return [ShotBoundary(0, 0, "start", 1.0)] + [ShotBoundary(cut, int(round(cut / info.source_fps / info.time_base[0] * info.time_base[1])), "manual", 1.0) for cut in cuts]
     thumbnails: list[np.ndarray] = []
     source_indices: list[int] = []
     stride = max(1, int(round(info.source_fps / 12.0)))
-    for frame_index, _, frame in iter_video_frames(info.path):
+    # Keep shot scouting bounded on long recordings.  A full 85-minute game
+    # would otherwise retain tens of thousands of thumbnails (~GBs) before
+    # scene detection can start.  The source frame index remains exact even
+    # when the scouting cadence is reduced.
+    max_thumbnails = 8000
+    estimated_thumbnails = (info.frame_count + stride - 1) // stride
+    if estimated_thumbnails > max_thumbnails:
+        stride = max(stride, (info.frame_count + max_thumbnails - 1) // max_thumbnails)
+    pts_per_frame = info.time_base[1] / (info.source_fps * info.time_base[0])
+    for frame_index, _, frame in iter_video_frames(info.path, pts_per_frame=pts_per_frame):
         if frame_index % stride == 0:
             thumbnails.append(frame[:: max(1, frame.shape[0] // 72), :: max(1, frame.shape[1] // 128)])
             source_indices.append(frame_index)
     if not thumbnails:
         return []
-    candidates = detect_shots(thumbnails, fps=max(1.0, info.source_fps / stride), scene_threshold=0.28)
+    scouting_scores = [scene_change_score(previous, current) for previous, current in zip(thumbnails, thumbnails[1:])]
     boundaries = []
-    for candidate in candidates:
-        source_index = source_indices[min(candidate.frame_index, len(source_indices) - 1)]
-        boundaries.append(ShotBoundary(source_index, int(round(source_index / info.source_fps / info.time_base[0] * info.time_base[1])), candidate.reason, candidate.confidence))
+    for score_index, score in enumerate(scouting_scores, start=1):
+        current_index = score_index - 1
+        neighborhood_start = max(0, current_index - 6)
+        neighborhood_end = min(len(scouting_scores), current_index + 7)
+        neighborhood = scouting_scores[neighborhood_start:neighborhood_end]
+        local_offset = current_index - neighborhood_start
+        neighborhood_without_current = neighborhood[:local_offset] + neighborhood[local_offset + 1 :]
+        local_baseline = float(np.median(np.asarray(neighborhood_without_current, dtype=float))) if neighborhood_without_current else 0.0
+        # A broadcast pan changes adjacent thumbnails gradually; a cut is a
+        # local spike. Require both an absolute difference and a multiple of
+        # nearby motion so long static camera motion is not reported as
+        # thousands of false cuts in a full game.
+        if score >= scene_threshold and score >= max(local_baseline * 3.0, 0.04):
+            source_index = source_indices[min(score_index, len(source_indices) - 1)]
+            boundaries.append(ShotBoundary(source_index, int(round(source_index / info.source_fps / info.time_base[0] * info.time_base[1])), "scene", min(1.0, score)))
     return boundaries
 
 
@@ -120,6 +149,22 @@ def _shot_index(frame_index: int, boundaries: Sequence[ShotBoundary]) -> int:
         else:
             break
     return current
+
+
+def _shot_id_for_frame(
+    frame_index: int,
+    boundaries: Sequence[ShotBoundary],
+    alignment: PlayAlignment | None = None,
+) -> str:
+    """Resolve the stable shot namespace, honoring reviewed bounded ranges."""
+
+    if alignment is not None and alignment.shot_ranges:
+        matches = [shot_id for shot_id, (start, end) in alignment.shot_ranges.items() if start <= frame_index < end]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ReplayAlignmentError(f"overlapping declared shot ranges cover source frame {frame_index}")
+    return f"shot-{_shot_index(frame_index, boundaries)}"
 
 
 def _build_detector(args: argparse.Namespace):
@@ -166,24 +211,35 @@ def _load_prototypes(path: Path | None) -> dict[str, Sequence[float]] | None:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("team prototypes must be a JSON object")
-    return {str(name): tuple(float(channel) for channel in channels) for name, channels in value.items()}
+    result: dict[str, Sequence[float]] = {}
+    for name, channels in value.items():
+        try:
+            values = tuple(float(channel) for channel in channels)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"team prototype {name!r} must contain numeric RGB values") from error
+        if len(values) != 3 or any(not np.isfinite(value) or not 0.0 <= value <= 1.0 for value in values):
+            raise ValueError(f"team prototype {name!r} must be three finite RGB values between 0 and 1")
+        result[str(name)] = values
+    if not result:
+        raise ValueError("team prototypes must contain at least one team")
+    return result
 
 
-def _load_calibrations(path: Path | None) -> dict[str, Homography]:
+def _load_calibrations(path: Path | None, source_sha256: str | None = None) -> dict[str, Homography]:
     if path is None:
         return {}
     value = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(value, dict) and int(value.get("schema_version", 1)) >= 2:
         return {}
-    return load_calibrations(path)
+    return load_calibrations(path, source_sha256=source_sha256)
 
 
-def _load_calibration_timeline(path: Path | None) -> CalibrationTimeline | None:
+def _load_calibration_timeline(path: Path | None, source_sha256: str | None = None) -> CalibrationTimeline | None:
     if path is None:
         return None
     value = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(value, dict) and int(value.get("schema_version", 1)) >= 2:
-        return load_calibration_timeline(path)
+        return load_calibration_timeline(path, source_sha256=source_sha256)
     return None
 
 
@@ -196,7 +252,7 @@ def _load_class_mapping(path: Path | None) -> dict[str, str] | None:
     return {str(key): str(name) for key, name in value.items()}
 
 
-def _load_reviewed_splits(path: Path | None) -> dict[str, list[dict[str, Any]]]:
+def _load_reviewed_splits(path: Path | None, source_sha256: str | None = None) -> dict[str, list[dict[str, Any]]]:
     if path is None:
         return {}
     try:
@@ -205,6 +261,9 @@ def _load_reviewed_splits(path: Path | None) -> dict[str, list[dict[str, Any]]]:
         raise ValueError(f"unable to read reviewed splits: {error}") from error
     if not isinstance(value, dict) or value.get("reviewed") is not True or not isinstance(value.get("splits"), dict):
         raise ValueError("reviewed splits must be marked reviewed: true and contain splits")
+    declared_source = value.get("source_sha256")
+    if source_sha256 is not None and (not declared_source or str(declared_source) != source_sha256):
+        raise ValueError("reviewed splits source sha256 does not match the input video")
     result: dict[str, list[dict[str, Any]]] = {}
     for tracklet_id, specs in value["splits"].items():
         if not isinstance(specs, list):
@@ -272,27 +331,55 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     destination = args.output
     destination.mkdir(parents=True, exist_ok=True)
     info = VideoInfo.from_path(source)
+    source_hash = sha256_file(source)
     process_start = int(args.start_frame)
     process_end = info.frame_count if args.end_frame is None else int(args.end_frame)
     if not 0 <= process_start < process_end <= info.frame_count:
         raise ValueError(f"analysis window must be within [0, {info.frame_count}] and non-empty")
     boundaries = _boundaries_for_video(info, args.manual_cut)
     ranges = shot_ranges(info.frame_count, boundaries)
-    alignment: PlayAlignment | None = load_play_alignment(args.play_alignment) if args.play_alignment else None
+    alignment: PlayAlignment | None = None
+    if args.play_alignment:
+        try:
+            alignment = load_play_alignment(args.play_alignment, source_sha256=source_hash)
+        except ReplayAlignmentError as error:
+            if "multiple plays" not in str(error):
+                raise
+            if not args.play_id:
+                raise ReplayAlignmentError("multi-play alignment requires --play-id for a bounded run") from error
+            selected = load_play_alignments(args.play_alignment, source_sha256=source_hash).by_id(args.play_id)
+            if selected is None:
+                raise ReplayAlignmentError(f"alignment does not contain play_id {args.play_id!r}") from error
+            alignment = selected
+        if args.play_id and alignment is not None and alignment.play_id != args.play_id:
+            raise ReplayAlignmentError(f"alignment play_id {alignment.play_id!r} does not match --play-id {args.play_id!r}")
     if alignment is not None:
         for anchor in alignment.anchors:
-            expected_shot = f"shot-{_shot_index(anchor.source_frame, boundaries)}"
+            if anchor.source_frame >= info.frame_count:
+                raise ReplayAlignmentError(f"alignment anchor {anchor.shot_id}:{anchor.source_frame} lies outside the source video")
+            expected_shot = _shot_id_for_frame(anchor.source_frame, boundaries, alignment)
             if expected_shot != anchor.shot_id:
                 raise ReplayAlignmentError(f"alignment anchor {anchor.shot_id}:{anchor.source_frame} falls in {expected_shot}")
-    source_hash = sha256_file(source)
+        for shot_id, (start, end) in alignment.shot_ranges.items():
+            if end > info.frame_count:
+                raise ReplayAlignmentError(f"alignment shot range {shot_id} lies outside the source video")
+    reviewed_reference = load_reviewed_mot_reference(args.reviewed_reference, source_sha256=source_hash) if args.reviewed_reference else None
+    reviewed_cross_shot_map = load_cross_shot_identity(args.reviewed_reference, source_sha256=source_hash) if args.reviewed_reference else None
+    calibrations = _load_calibrations(args.calibration, source_hash)
+    calibration_timeline = _load_calibration_timeline(args.calibration, source_hash)
+    calibration_quality = timeline_quality_report(calibration_timeline) if calibration_timeline is not None else calibration_quality_report(calibrations)
+    reviewed_splits = _load_reviewed_splits(args.reviewed_splits, source_hash)
     checkpoint_hash = sha256_file(args.detector_checkpoint) if args.detector_checkpoint and Path(args.detector_checkpoint).is_file() else None
     calibration_hash = sha256_file(args.calibration) if args.calibration and args.calibration.is_file() else None
     alignment_hash = sha256_file(args.play_alignment) if args.play_alignment and args.play_alignment.is_file() else None
+    class_mapping_hash = sha256_file(args.detector_class_mapping) if args.detector_class_mapping and args.detector_class_mapping.is_file() else None
+    cache_input_hash = sha256_file(args.detection_cache) if args.detection_cache and args.detection_cache.is_file() else None
     prototypes_hash = sha256_file(args.team_prototypes) if args.team_prototypes and args.team_prototypes.is_file() else None
     reference_hash = sha256_file(args.reviewed_reference) if args.reviewed_reference and args.reviewed_reference.is_file() else None
     split_hash = sha256_file(args.reviewed_splits) if args.reviewed_splits and args.reviewed_splits.is_file() else None
     tracker_config = {
         "tracker": args.tracker,
+        "botsort_cmc": args.botsort_cmc if args.tracker == "botsort" else None,
         "mcbyte_device": args.mcbyte_device if args.tracker == "mcbyte" else None,
         "mcbyte_masks": args.mcbyte_masks if args.tracker == "mcbyte" else None,
         "sam_checkpoint_sha256": sha256_file(args.mcbyte_sam_checkpoint) if args.mcbyte_sam_checkpoint and args.mcbyte_sam_checkpoint.is_file() else None,
@@ -303,17 +390,23 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     detector_hash = config_hash(detector_config)
     analysis_config = {
         "schema_version": 2,
+        "pipeline_version": package_version("football-tracking", "0.1.0"),
+        "source_sha256": source_hash,
         "detector_hash": detector_hash,
+        "detector_class_mapping_sha256": class_mapping_hash,
+        "detection_cache_sha256": cache_input_hash,
         "tracker_hash": tracker_hash,
         "calibration_sha256": calibration_hash,
         "alignment_sha256": alignment_hash,
+        "play_id": args.play_id,
         "team_prototypes_sha256": prototypes_hash,
         "reviewed_splits_sha256": split_hash,
         "manual_cuts": sorted(int(cut) for cut in args.manual_cut),
         "boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries],
         "window": {"start_frame": process_start, "end_frame": process_end},
-        "resolver_policy": {"threshold": args.identity_threshold, "margin": args.identity_margin, "max_field_distance_yards": args.identity_max_distance_yards, "min_overlap_samples": 5, "min_overlap_duration_s": args.identity_min_overlap_duration_s, "sample_tolerance_s": 0.05},
+        "resolver_policy": {"threshold": args.identity_threshold, "margin": args.identity_margin, "max_field_distance_yards": args.identity_max_distance_yards, "min_overlap_samples": 5, "min_overlap_duration_s": args.identity_min_overlap_duration_s, "sample_tolerance_s": 0.05, "max_position_uncertainty_yards": args.identity_max_position_uncertainty_yards},
         "contact_policy": {"source": "bottom_center", "version": 1},
+        "team_sampling_policy": {"target_hz": 5.0, "feature_stride_frames": max(1, int(round(info.source_fps / 5.0)))},
     }
     analysis_hash = config_hash(analysis_config)
     run_id = f"run-{source_hash[:12]}-{args.tracker}-{analysis_hash[:8]}"
@@ -329,15 +422,20 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     expected_provenance = {"checkpoint_sha256": checkpoint_hash, "class_mapping": configured_class_mapping, "proxy": args.detector == "synthetic"}
     detector = None
     detector_is_proxy = args.detector == "synthetic"
+    detector_provenance_known = True
     cached: dict[int, list[Detection]] | None = None
     if cache_path.is_file():
         try:
             cached = (
                 DetectionCache.load_strict(cache_path, source_hash, detector_hash, frame_count=info.frame_count, provenance=expected_provenance)
-                if strict_shared_cache else DetectionCache.load(cache_path, source_hash=source_hash, detector_config_hash=detector_hash)
+                if strict_shared_cache else DetectionCache.load(cache_path, source_hash=source_hash, detector_config_hash=detector_hash, frame_start=process_start, frame_end=process_end)
             )
-            if cached is not None and not set(range(process_start, process_end)).issubset(cached):
-                cached = None
+            if cached is not None:
+                cached_provenance = DetectionCache.load_provenance(cache_path, source_hash, detector_hash)
+                if cached_provenance is not None and "proxy" in cached_provenance:
+                    detector_is_proxy = bool(cached_provenance["proxy"])
+                else:
+                    detector_provenance_known = False
         except CacheMismatch:
             if strict_shared_cache:
                 raise
@@ -351,15 +449,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     timer = StageTimer()
     raw_tracks: list[TrackObservation] = []
     tracklet_features: dict[str, list[tuple[float, float, float]]] = {}
+    last_feature_frame: dict[str, int] = {}
+    feature_stride = max(1, int(round(info.source_fps / 5.0)))
     detections_for_cache: dict[int, list[Detection]] = {}
-    current_shot = -1
+    current_shot: str | None = None
     tracker: TrackerAdapter | None = None
     tracker_modes: list[dict[str, Any]] = []
     with timer.stage("decode_and_track"):
-        for frame_index, pts, frame in iter_video_frames(source, start_frame=process_start, end_frame=process_end):
-            shot_index = _shot_index(frame_index, boundaries)
-            shot_id = f"shot-{shot_index}"
-            if shot_index != current_shot:
+        pts_per_frame = info.time_base[1] / (info.source_fps * info.time_base[0])
+        frame_iterator = iter_video_frames(source) if process_start == 0 and process_end == info.frame_count else iter_video_frames(source, start_frame=process_start, end_frame=process_end, pts_per_frame=pts_per_frame)
+        for frame_index, pts, frame in frame_iterator:
+            shot_id = _shot_id_for_frame(frame_index, boundaries, alignment)
+            if shot_id != current_shot:
                 if tracker is not None and isinstance(tracker, McByteTracker):
                     tracker_modes.append(tracker.effective_mode())
                 tracker = _build_tracker(
@@ -370,7 +471,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                     mcbyte_masks=args.mcbyte_masks,
                 )
                 memory_budget.sample("tracker_initialization")
-                current_shot = shot_index
+                current_shot = shot_id
             assert tracker is not None
             if cached is not None:
                 detections = cached.get(frame_index, [])
@@ -392,8 +493,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 y1, y2 = min(y1, frame.shape[0] - 1), min(y2, frame.shape[0])
                 if x2 > x1 and y2 > y1:
                     feature = team_feature_from_crop(frame[y1:y2, x1:x2])
-                    if feature is not None:
+                    if feature is not None and (row.tracklet_id not in last_feature_frame or frame_index - last_feature_frame[row.tracklet_id] >= feature_stride):
                         tracklet_features.setdefault(row.tracklet_id, []).append(feature)
+                        last_feature_frame[row.tracklet_id] = frame_index
     if isinstance(tracker, McByteTracker):
         tracker_modes.append(tracker.effective_mode())
     memory_budget.sample("tracking_complete")
@@ -411,8 +513,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         )
         (destination / "detector-class-mapping.json").write_text(json.dumps(class_mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     timer.timings.setdefault("detection_s", 0.0)
-    reviewed_splits = _load_reviewed_splits(args.reviewed_splits)
     refined_segments = refine_tracklets(raw_tracks, reviewed_splits or None)
+    refinement_report = tracklet_conflict_report(raw_tracks)
     segment_for_observation: dict[tuple[str, int], str] = {}
     for segment in refined_segments:
         for row in segment.observations:
@@ -435,12 +537,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         TrackObservation(segment_for_observation.get((row.tracklet_id, row.frame_index), row.tracklet_id), row.frame_index, row.pts, row.bbox_xyxy_px, row.score, row.state)
         for row in raw_tracks
     ]
+    frame_sets: dict[str, set[int]] = {}
+    for row in identity_tracks:
+        frame_sets.setdefault(row.tracklet_id, set()).add(row.frame_index)
+    tracklet_frames = {tracklet_id: tuple(sorted(frames)) for tracklet_id, frames in frame_sets.items()}
     team_prototypes = _load_prototypes(args.team_prototypes)
     teams = resolve_teams(summaries, prototypes=team_prototypes)
     identity_links: list[IdentityLink] = []
     link_report: dict[str, Any] = {"status": "not_attempted", "reason": "--play-alignment was not provided"}
-    calibrations = _load_calibrations(args.calibration)
-    calibration_timeline = _load_calibration_timeline(args.calibration)
     observations: list[Observation] = []
     for row in raw_tracks:
         identity_tracklet_id = segment_for_observation.get((row.tracklet_id, row.frame_index), row.tracklet_id)
@@ -464,7 +568,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             position_source=None,
             calibration_id=None,
             identity_version=2,
-            play_id=alignment.play_id if alignment and shot_id in alignment.shots() else None,
+            play_id=alignment.play_id if alignment and shot_id in alignment.shots() and (not alignment.shot_ranges or alignment.shot_ranges.get(shot_id, (row.frame_index, row.frame_index + 1))[0] <= row.frame_index < alignment.shot_ranges.get(shot_id, (row.frame_index, row.frame_index + 1))[1]) else None,
             source_tracklet_id=source_tracklet_id,
         )
         estimate = calibration_timeline.at(observation.shot_id, observation.pts) if calibration_timeline is not None else None
@@ -475,9 +579,16 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 homography,
                 calibration_status=estimate.status if estimate is not None else homography.status,
                 calibration_reason=estimate.reason if estimate is not None else homography.reason,
+                support_polygon_px=estimate.support_polygon_px if estimate is not None else None,
             )
         observations.append(observation)
     if alignment is not None:
+        link_report["timing_status"] = "validated_pts_map" if alignment.timing_eligible else "unverified_alignment_source" if alignment.time_map is not None and not alignment.source_hash_validated else "reviewed_pts_map" if alignment.time_map is not None else "legacy_unvalidated_equal_rate"
+        if alignment.timing_report is not None:
+            link_report["timing_report"] = dict(alignment.timing_report)
+        link_report["calibration_status"] = "timeline_withheld_validated" if calibration_timeline is not None and calibration_timeline.identity_eligible_shots() else "legacy_static_unvalidated_compatibility" if calibrations else "not_provided"
+        link_report["calibration_quality"] = calibration_quality
+        link_report["team_evidence"] = {tracklet_id: {"team": evidence.team, "score": evidence.score, "crop_count": evidence.crop_count, "assignment_coverage": evidence.assignment_coverage, "ambiguity": evidence.ambiguity} for tracklet_id, evidence in sorted(teams.items())}
         observations = [
             replace(
                 observation,
@@ -488,21 +599,32 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         ]
         field_tracks: dict[str, list[FieldTrack]] = {}
         samples: dict[str, list[tuple[float, float, float]]] = {}
+        sample_uncertainties: dict[str, list[float]] = {}
         for observation in observations:
-            if observation.field_xy_yards is None or observation.calibration_status == "invalid":
+            if observation.play_id != alignment.play_id:
+                continue
+            if observation.field_xy_yards is None or observation.calibration_status == "invalid" or (calibration_timeline is not None and observation.calibration_status != "valid"):
                 continue
             play_time = observation.play_time_s
             if play_time is None:
                 continue
             samples.setdefault(observation.tracklet_id, []).append((play_time, *observation.field_xy_yards))
+            sample_uncertainties.setdefault(observation.tracklet_id, []).append(float(observation.position_uncertainty_yards or 0.0))
         for tracklet_id, rows in samples.items():
             shot_id = tracklet_id.split(":", 1)[0]
-            field_tracks.setdefault(shot_id, []).append(FieldTrack(tracklet_id, shot_id, tuple(sorted(rows))))
+            paired = sorted(zip(rows, sample_uncertainties.get(tracklet_id, [0.0] * len(rows))), key=lambda pair: pair[0][0])
+            field_tracks.setdefault(shot_id, []).append(FieldTrack(tracklet_id, shot_id, tuple(item[0] for item in paired), tuple(item[1] for item in paired)))
         aligned_shots = list(alignment.shots())
         calibrated_shots = set(calibrations) | (set(calibration_timeline.identity_eligible_shots()) if calibration_timeline is not None else set())
         present_shots = [shot for shot in aligned_shots if field_tracks.get(shot)]
         if len(present_shots) < 2:
             link_report = {"status": "abstained", "reason": "no calibrated field positions for the aligned shots", "unresolved_shots": [shot for shot in aligned_shots if shot not in present_shots]}
+        elif calibration_timeline is None and calibrations and "*" in calibrations:
+            link_report = {"status": "abstained", "reason": "cross-shot resolution requires shot-specific calibration"}
+        elif calibration_timeline is None and calibrations and "*" not in calibrations:
+            link_report = {"status": "abstained", "reason": "legacy static calibration is unvalidated for cross-shot identity; supply a schema-v2 timeline with withheld landmarks", "unresolved_shots": []}
+        elif not alignment.timing_eligible:
+            link_report = {"status": "abstained", "reason": "play-time map or alignment source hash has no passing validation", "unresolved_shots": [shot for shot in aligned_shots if shot not in present_shots]}
         elif any(shot not in calibrated_shots for shot in present_shots):
             # A "*" shared-homography fallback is not shot-specific: applying one
             # camera pose's transform to another shot would make "field position"
@@ -516,7 +638,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 calibration=calibration_timeline or calibrations,
                 time_map=alignment.time_map,
                 teams=teams,
-                policy=ResolutionPolicy(threshold=args.identity_threshold, margin=args.identity_margin, max_field_distance_yards=args.identity_max_distance_yards, min_overlap_duration_s=args.identity_min_overlap_duration_s),
+                policy=ResolutionPolicy(threshold=args.identity_threshold, margin=args.identity_margin, max_field_distance_yards=args.identity_max_distance_yards, min_overlap_duration_s=args.identity_min_overlap_duration_s, max_position_uncertainty_yards=args.identity_max_position_uncertainty_yards),
+                tracklet_frames=tracklet_frames,
+                tracklet_play_ids={tracklet_id: alignment.play_id for tracklet_id in tracklet_ids},
             )
             identity_links = [link for link in resolution.links if link.decision == "same"]
             link_report = resolution.to_dict()
@@ -525,7 +649,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             link_report["accepted_links"] = len(identity_links)
             if len(aligned_shots) <= 2:
                 link_report["note"] = "only the first two aligned shots are resolved in this milestone"
-    identity_map = stable_anonymous_ids(tracklet_ids, identity_links)
+        link_report.setdefault("timing_status", "validated_pts_map" if alignment.timing_eligible else "unverified_alignment_source" if alignment.time_map is not None and not alignment.source_hash_validated else "reviewed_pts_map" if alignment.time_map is not None else "legacy_unvalidated_equal_rate")
+        if alignment.timing_report is not None:
+            link_report.setdefault("timing_report", dict(alignment.timing_report))
+        link_report.setdefault("calibration_quality", calibration_quality)
+        link_report.setdefault("team_evidence", {tracklet_id: {"team": evidence.team, "score": evidence.score, "crop_count": evidence.crop_count, "assignment_coverage": evidence.assignment_coverage, "ambiguity": evidence.ambiguity} for tracklet_id, evidence in sorted(teams.items())})
+    identity_map = stable_anonymous_ids(
+        tracklet_ids,
+        identity_links,
+        tracklet_frames=tracklet_frames,
+        tracklet_play_ids={tracklet_id: alignment.play_id if alignment is not None else None for tracklet_id in tracklet_ids},
+        tracklet_teams={tracklet_id: evidence.team for tracklet_id, evidence in teams.items()},
+    )
     observations = [
         replace(observation, player_id=identity_map.get(observation.tracklet_id))
         for observation in observations
@@ -547,8 +682,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         write_observations_csv(destination / "observations.csv", observations)
         write_observations_parquet(destination / "observations.parquet", observations)
         write_trajectories_csv(destination / "trajectories.csv", observations)
+        write_play_trajectories_csv(destination / "play-trajectories.csv", observations)
         write_identities_json(destination / "identities.json", identity_map)
         write_metrics_json(destination / "identity-links.json", link_report)
+        write_metrics_json(destination / "analysis-config.json", {"schema_version": 2, "analysis_hash": analysis_hash, "source_sha256": source_hash, "analysis": analysis_config, "detector": detector_config, "tracker": tracker_config, "evaluation_reference_sha256": reference_hash, "cache": {"path": str(cache_path), "sha256": cache_input_hash, "strict_shared": strict_shared_cache, "provenance": expected_provenance}})
         write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges})
         trajectories: dict[tuple[str, str], list[tuple[float, float]]] = {}
         for observation in observations:
@@ -556,9 +693,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 trajectories.setdefault((observation.player_id, observation.shot_id), []).append(observation.field_xy_yards)
         write_field_view(destination / "field-view.png", trajectories)
         if calibration_timeline is not None:
-            write_metrics_json(destination / "calibration.json", calibration_timeline.to_dict())
+            calibration_artifact = calibration_timeline.to_dict()
+            calibration_artifact["source_sha256"] = source_hash
+            write_metrics_json(destination / "calibration.json", calibration_artifact)
         else:
-            write_calibration_json(destination / "calibration.json", calibrations)
+            write_calibration_json(destination / "calibration.json", calibrations, source_sha256=source_hash)
+        write_metrics_json(destination / "calibration-quality.json", calibration_quality)
+        write_metrics_json(destination / "tracklet-refinement.json", refinement_report)
         resolved = link_report.get("status") == "resolved"
         write_review_json(destination / "review.json", {
             "status": "resolved_cross_view" if resolved else "unresolved_cross_view",
@@ -577,22 +718,40 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     memory_budget.sample("export_complete")
     quality_report: dict[str, Any]
     if args.reviewed_reference is None:
-        quality_report = {"status": "not_evaluated", "reason": "--reviewed-reference was not provided"}
+        quality_report = {"status": "not_evaluated", "reason": "--reviewed-reference was not provided", "calibration": calibration_quality}
     else:
         try:
-            reviewed_reference = load_reviewed_mot_reference(args.reviewed_reference)
-            quality_report = evaluate_tracking(raw_tracks, reviewed_reference)
+            assert reviewed_reference is not None
+            evaluation_reference = restrict_reference_to_window(reviewed_reference, process_start, process_end)
+            quality_report = evaluate_tracking(raw_tracks, evaluation_reference)
             quality_report["reference_path"] = str(args.reviewed_reference)
             quality_report["reference_sha256"] = sha256_file(args.reviewed_reference)
+            quality_report["evaluation_window"] = {"start_frame": process_start, "end_frame": process_end}
+            quality_report["calibration"] = calibration_quality
+            contact_report = evaluate_ground_contact_positions(observations, evaluation_reference)
+            quality_report["ground_contact"] = contact_report
+            quality_report["team"] = evaluate_team_assignment(observations, evaluation_reference)
             quality_report["cross_shot"] = evaluate_cross_shot_identity(
                 identity_map,
                 identity_tracks,
-                reviewed_reference,
-                load_cross_shot_identity(args.reviewed_reference),
+                evaluation_reference,
+                reviewed_cross_shot_map,
             )
         except EvaluationError as error:
             quality_report = {"status": "not_evaluated", "reason": f"{type(error).__name__}: {error}"}
+    quality_report["promotion_gate"] = evaluate_promotion_gates(quality_report, quality_report.get("cross_shot"), calibration_quality, ground_contact_report=quality_report.get("ground_contact"), proxy_detector=detector_is_proxy or not detector_provenance_known, team_report=quality_report.get("team"))
     write_metrics_json(destination / "tracking-evaluation.json", quality_report)
+    write_review_json(destination / "review.json", {
+        "status": "resolved_cross_view" if resolved else "unresolved_cross_view",
+        "shot_count": len(boundaries),
+        "cross_view_identity_resolved": resolved,
+        "cross_shot_links": link_report.get("accepted_links", 0),
+        "promotion_gate": quality_report["promotion_gate"],
+        "notes": [
+            "Replay relationship resolved: identity-links.json records the accepted cross-shot tracklet pairs from the reviewed play alignment." if resolved else "Replay relationship remains unresolved unless manually aligned and linked.",
+            "Generic or proxy detector identities are not roster identities.",
+        ],
+    })
     status = "complete" if resolved else "complete_with_unresolved"
     timer.timings["peak_rss_mb"] = memory_budget.peak_mb
     manifest = RunManifest(
@@ -617,11 +776,15 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "status": status,
         "system": system_info(),
         "track_summary": summarize_tracks(raw_tracks),
+        "tracklet_refinement": refinement_report,
+        "team_evidence": {tracklet_id: {"team": evidence.team, "score": evidence.score, "source": evidence.source, "crop_count": evidence.crop_count, "assignment_coverage": evidence.assignment_coverage, "ambiguity": evidence.ambiguity} for tracklet_id, evidence in sorted(teams.items())},
         "observation_count": len(observations),
         "proxy_detector": detector_is_proxy,
+        "detector_provenance_known": detector_provenance_known,
         "detection_cache_hit": cached is not None,
-        "detector_cache": {"path": str(cache_path), "strict_shared": strict_shared_cache, "provenance": expected_provenance},
-        "analysis": {"schema_version": 2, "analysis_hash": analysis_hash, "calibration_sha256": calibration_hash, "alignment_sha256": alignment_hash, "team_prototypes_sha256": prototypes_hash, "reviewed_splits_sha256": split_hash, "reference_sha256": reference_hash, "boundary_count": len(boundaries)},
+        "detector_cache": {"path": str(cache_path), "strict_shared": strict_shared_cache, "provenance": expected_provenance, "frame_start": process_start, "frame_end": process_end},
+        "analysis": {"schema_version": 2, "analysis_hash": analysis_hash, "calibration_sha256": calibration_hash, "alignment_sha256": alignment_hash, "detector_class_mapping_sha256": class_mapping_hash, "detection_cache_sha256": cache_input_hash, "play_id": args.play_id, "team_prototypes_sha256": prototypes_hash, "reviewed_splits_sha256": split_hash, "reference_sha256": reference_hash, "boundary_count": len(boundaries)},
+        "calibration": calibration_quality,
         "window": {"start_frame": process_start, "end_frame": process_end, "processed_frame_count": process_end - process_start, "source_frame_count": info.frame_count},
         "tracker_config": tracker_config,
         "mcbyte": tracker_modes or None,
@@ -629,7 +792,45 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "quality": {"status": quality_report["status"]},
         "timings": timer.timings,
     })
+    write_metrics_json(destination / "artifact-validation.json", validate_run_artifacts(destination))
     return manifest.to_dict()
+
+
+def run_batch(args: argparse.Namespace) -> dict[str, Any]:
+    """Run one bounded pipeline per reviewed play in an alignment set."""
+
+    if args.play_alignment is None:
+        raise ValueError("batch requires --play-alignment")
+    if not args.input.is_file():
+        raise FileNotFoundError(args.input)
+    alignment_set = load_play_alignments(args.play_alignment, source_sha256=sha256_file(args.input))
+    if not alignment_set.plays:
+        raise ReplayAlignmentError("batch alignment set contains no plays")
+    args.output.mkdir(parents=True, exist_ok=True)
+    reports: list[dict[str, Any]] = []
+    for play in alignment_set.plays:
+        if not play.shot_ranges:
+            raise ReplayAlignmentError(f"batch play {play.play_id} needs shot_ranges for bounded execution")
+        start_frame = min(interval[0] for interval in play.shot_ranges.values())
+        end_frame = max(interval[1] for interval in play.shot_ranges.values())
+        child = argparse.Namespace(**vars(args))
+        child.play_id = play.play_id
+        child.start_frame = start_frame
+        child.end_frame = end_frame
+        child.output = args.output / play.play_id
+        child.manual_cut = sorted(set(args.manual_cut) | {start for start, _ in play.shot_ranges.values() if start > 0})
+        try:
+            manifest = run_pipeline(child)
+            child_evaluation = json.loads((child.output / "tracking-evaluation.json").read_text(encoding="utf-8"))
+            reports.append({"play_id": play.play_id, "status": "complete", "manifest_status": manifest.get("status"), "promotion_gate_status": child_evaluation.get("promotion_gate", {}).get("status"), "manifest": manifest, "output": str(child.output), "window": {"start_frame": start_frame, "end_frame": end_frame}})
+        except Exception as error:
+            reports.append({"play_id": play.play_id, "status": "unavailable", "error": f"{type(error).__name__}: {error}", "output": str(child.output), "window": {"start_frame": start_frame, "end_frame": end_frame}})
+    execution_complete = all(report["status"] == "complete" for report in reports)
+    identity_complete = all(report.get("manifest_status") == "complete" and report.get("promotion_gate_status") == "passed" for report in reports)
+    status = "complete" if execution_complete and identity_complete else "complete_with_unresolved" if execution_complete else "incomplete"
+    result = {"schema_version": 1, "status": status, "source": str(args.input), "alignment": str(args.play_alignment), "alignment_sha256": sha256_file(args.play_alignment), "plays": reports}
+    write_metrics_json(args.output / "batch.json", result)
+    return result
 
 
 def _tracker_benchmark(source: Path, info: VideoInfo, boundaries: Sequence[ShotBoundary], kind: str) -> dict[str, Any]:
@@ -752,6 +953,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = run_pipeline(args)
         elif args.command == "benchmark":
             result = benchmark(args)
+        elif args.command == "batch":
+            result = run_batch(args)
         elif args.command == "cache":
             result = build_cache_chunk(args)
         else:

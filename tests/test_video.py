@@ -76,3 +76,14 @@ def test_frame_pts_are_cached_between_streaming_passes(tmp_path, monkeypatch) ->
     list(video_module.iter_video_frames(path))
     list(video_module.iter_video_frames(path))
     assert len(calls) == 1
+
+
+def test_bounded_streaming_can_use_declared_pts_step_without_full_index(tmp_path) -> None:
+    path = tmp_path / "bounded.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (16, 16))
+    assert writer.isOpened()
+    for _ in range(4):
+        writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+    writer.release()
+    rows = list(iter_video_frames(path, start_frame=1, end_frame=3, pts_per_frame=100.0))
+    assert [(row[0], row[1]) for row in rows] == [(1, 100), (2, 200)]

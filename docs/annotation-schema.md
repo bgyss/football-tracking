@@ -19,7 +19,8 @@ coordinates match the video being evaluated. A model proposal is never ground tr
       "start_frame": 1200,
       "end_frame": 1450,
       "play_id": "game-001-play-0042",
-      "split": "development"
+      "split": "development",
+      "camera_label": "sideline"
     }
   },
   "annotations": [
@@ -27,17 +28,27 @@ coordinates match the video being evaluated. A model proposal is never ground tr
       "id": "shot-0-frame-1234-player-17",
       "shot_id": "shot-0",
       "source_frame": 1234,
+      "pts": 123400,
       "bbox_xyxy_px": [100, 200, 130, 300],
       "track_id": "player-17",
       "team": "DET",
       "visibility": "visible",
       "ground_contact": "evaluable",
       "review_status": "reviewed",
-      "coordinate_space": "source"
+      "coordinate_space": "source",
+      "reviewer": "reviewer-1",
+      "revision": 1,
+      "reviewed_at": "2026-09-15T00:00:00Z",
+      "annotation_confidence": 1.0
     }
   ]
 }
 ```
+
+Landmark records use the same manifest with `image_xy_px`, `field_xy_yards`, `role` (`fit`
+or `withheld`), `source_frame`, `pts`, and an optional semantic `landmark_id` such as
+`yardline:20:hash:near`. When a semantic ID is present, its canonical field coordinate is
+checked before fitting, which catches mirrored or mislabeled field orientations.
 
 The source image is 1920×1080 in the supplied All-22 file. `source_frame` and `pts` are
 kept in the original media coordinate system. Crop or resized review images must be
@@ -59,11 +70,24 @@ Keep these labels separate:
 The review pack produced by `scripts/build_identity_review_pack.py` is intentionally
 `reviewed: false`. Reviewers must confirm source frame, PTS, shot interval, play grouping,
 split, landmark semantics, visibility/occlusion, and identity ambiguity before changing
-that state. Unknown or ambiguous players remain explicit and are excluded only under the
-declared evaluation policy.
+that state. It may include Hough field-line proposals, but those are hints and must be
+replaced by semantic, human-reviewed landmarks. Unknown or ambiguous players remain
+explicit and are excluded only under the declared evaluation policy.
+
+`scripts/build_annotation_manifest.py` copies the pack's source metadata and frame/PTS
+records into a manifest template after the reviewer declares shot ranges and camera labels.
+It keeps `reviewed: false`; reviewers still must add and approve all boxes, landmarks,
+timing events, contacts, and identities.
 
 For moving All-22 cameras, `calibration_timeline.py` can estimate a field-only
 inter-frame transform when supplied a static-field mask. The transform is composed as
 `H_current = H_keyframe @ inverse(G_current_from_keyframe)` and is discarded when fewer
 than four robust correspondences remain. This motion estimate is a propagation proposal;
 absolute reviewed landmarks and withheld validation remain the authority for identity.
+
+Once the manifest contains reviewed landmark records, call
+`timeline_from_landmark_records(manifest.landmarks)` to fit the schema-v2 timeline. Each
+keyframe needs at least four `fit` records and one independent `withheld` record; intervals
+are bounded by the next reviewed keyframe and are never extrapolated. The generated
+timeline must carry the input `source_sha256`; the CLI refuses source-hashed mismatches
+and does not permit legacy static files to create cross-shot joins.

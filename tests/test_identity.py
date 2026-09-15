@@ -40,6 +40,12 @@ def test_resolve_teams_keeps_tied_crop_votes_unknown() -> None:
     assert result["ambiguous"].source == "ambiguous_rgb_prototype"
 
 
+def test_unsupervised_team_clusters_are_diagnostic_only_for_cross_shot_links() -> None:
+    result = resolve_teams([TrackletSummary("clustered", team_features=((0.1, 0.2, 0.9),))])
+    assert result["clustered"].source == "rgb_cluster"
+    assert result["clustered"].eligible is False
+
+
 def test_match_tracklets_is_one_to_one_and_abstains_on_low_margin() -> None:
     scores = {
         ("left-1", "right-1"): 0.95,
@@ -68,6 +74,51 @@ def test_match_tracklets_abstains_on_globally_tied_assignment() -> None:
 def test_stable_anonymous_ids_rejects_same_shot_component_conflict() -> None:
     with pytest.raises(ValueError, match="same shot"):
         stable_anonymous_ids(["shot-0:a", "shot-0:b", "shot-1:c"], [IdentityLink("shot-0:a", "shot-1:c", "same", 0.9), IdentityLink("shot-0:b", "shot-1:c", "same", 0.9)])
+
+
+def test_stable_anonymous_ids_allows_reviewed_nonoverlapping_fragments() -> None:
+    result = stable_anonymous_ids(
+        ["shot-0:a", "shot-0:b", "shot-1:c"],
+        [IdentityLink("shot-0:a", "shot-1:c", "same", 0.9), IdentityLink("shot-0:b", "shot-1:c", "same", 0.9)],
+        tracklet_frames={"shot-0:a": [0, 1], "shot-0:b": [2, 3], "shot-1:c": [0, 1, 2, 3]},
+    )
+    assert result["shot-0:a"] == result["shot-0:b"] == result["shot-1:c"]
+
+
+def test_stable_anonymous_ids_rejects_incomplete_frame_metadata() -> None:
+    with pytest.raises(ValueError, match="overlapping"):
+        stable_anonymous_ids(
+            ["shot-0:a", "shot-0:b", "shot-1:c"],
+            [IdentityLink("shot-0:a", "shot-1:c", "same", 0.9), IdentityLink("shot-0:b", "shot-1:c", "same", 0.9)],
+            tracklet_frames={"shot-0:a": [0, 1]},
+        )
+
+
+def test_stable_anonymous_ids_rejects_incompatible_play_components() -> None:
+    with pytest.raises(ValueError, match="incompatible plays"):
+        stable_anonymous_ids(
+            ["shot-0:a", "shot-1:b"],
+            [IdentityLink("shot-0:a", "shot-1:b", "same", 0.9)],
+            tracklet_play_ids={"shot-0:a": "play-a", "shot-1:b": "play-b"},
+        )
+
+
+def test_stable_anonymous_ids_rejects_contradictory_team_components() -> None:
+    with pytest.raises(ValueError, match="contradictory teams"):
+        stable_anonymous_ids(
+            ["shot-0:a", "shot-1:b"],
+            [IdentityLink("shot-0:a", "shot-1:b", "same", 0.9)],
+            tracklet_teams={"shot-0:a": "DET", "shot-1:b": "LAR"},
+        )
+
+
+def test_stable_anonymous_ids_rejects_contradictory_jersey_evidence() -> None:
+    with pytest.raises(ValueError, match="jersey"):
+        stable_anonymous_ids(
+            ["shot-0:a", "shot-1:b"],
+            [IdentityLink("shot-0:a", "shot-1:b", "same", 0.9)],
+            tracklet_jerseys={"shot-0:a": (17,), "shot-1:b": (9,)},
+        )
 
 
 def test_stable_anonymous_ids_are_deterministic_and_validate_links() -> None:
