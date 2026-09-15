@@ -15,7 +15,7 @@ from .cache import CacheMismatch, DetectionCache
 from .calibration import Homography, load_calibrations, project_observation
 from .detector import Detection, RFDETRDetector, SyntheticDetector
 from .export import StageTimer, render_annotated_video, write_calibration_json, write_field_view, write_identities_json, write_manifest_json, write_metrics_json, write_observations_csv, write_observations_parquet, write_review_json, write_trajectories_csv
-from .identity import TrackletSummary, resolve_teams, stable_anonymous_ids, team_feature_from_crop
+from .identity import IdentityLink, TrackletSummary, resolve_teams, stable_anonymous_ids, team_feature_from_crop
 from .evaluation import EvaluationError, evaluate_tracking, load_reviewed_mot_reference
 from .metrics import config_hash, package_version, sha256_file, summarize_tracks, system_info
 from .memory import MemoryBudget
@@ -337,7 +337,22 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     summaries = [TrackletSummary(tracklet_id, tuple(row for row in raw_tracks if row.tracklet_id == tracklet_id), tuple(tracklet_features.get(tracklet_id, ()))) for tracklet_id in tracklet_ids]
     team_prototypes = _load_prototypes(args.team_prototypes)
     teams = resolve_teams(summaries, prototypes=team_prototypes)
-    identity_map = stable_anonymous_ids(tracklet_ids, [])
+    identity_links: list[IdentityLink] = []
+    link_report: dict[str, Any] = {"status": "not_attempted", "reason": "--play-alignment was not provided"}
+    identity_map = stable_anonymous_ids(tracklet_ids, identity_links)
+    by_player: dict[str, set[str]] = {}
+    for tracklet_id, player_id in identity_map.items():
+        by_player.setdefault(player_id, set()).add(tracklet_id.split(":", 1)[0])
+    link_report.update({
+        "shot_count": len(boundaries),
+        "tracklet_count": len(tracklet_ids),
+        "player_id_count": len(set(identity_map.values())),
+        "cross_shot_player_ids": sum(1 for shots in by_player.values() if len(shots) > 1),
+        "links": [
+            {"left_key": link.left_key, "right_key": link.right_key, "decision": link.decision, "score": link.score}
+            for link in identity_links
+        ],
+    })
     calibrations = _load_calibrations(args.calibration)
     observations: list[Observation] = []
     for row in raw_tracks:
@@ -369,6 +384,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         write_observations_parquet(destination / "observations.parquet", observations)
         write_trajectories_csv(destination / "trajectories.csv", observations)
         write_identities_json(destination / "identities.json", identity_map)
+        write_metrics_json(destination / "identity-links.json", link_report)
         write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges})
         trajectories: dict[str, list[tuple[float, float]]] = {}
         for observation in observations:

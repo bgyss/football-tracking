@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cv2
+import json
 import numpy as np
 import csv
 
@@ -90,3 +91,22 @@ def test_run_records_detection_and_tracking_stage_timings(tmp_path) -> None:
     assert '"tracking_s"' in metrics
     with (output_path / "observations.csv").open(newline="") as handle:
         assert {row["shot_id"] for row in csv.DictReader(handle)} == {"shot-0", "shot-1"}
+
+
+def test_run_emits_identity_links_evidence_and_defaults_to_unlinked(tmp_path) -> None:
+    input_path = tmp_path / "tiny.mp4"
+    output = tmp_path / "run"
+    make_video(input_path)
+
+    exit_code = main([
+        "run", "--input", str(input_path), "--output", str(output),
+        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
+    ])
+    assert exit_code == 0
+
+    report = json.loads((output / "identity-links.json").read_text(encoding="utf-8"))
+    assert report["status"] == "not_attempted"
+    assert report["reason"] == "--play-alignment was not provided"
+    assert report["links"] == []
+    assert report["cross_shot_player_ids"] == 0
+    assert report["player_id_count"] == report["tracklet_count"]
