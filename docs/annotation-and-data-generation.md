@@ -25,7 +25,7 @@ The tutorial's remaining steps use Roboflow Universe, Annotate, Train, Workflows
 
 Use [CVAT Community](https://github.com/cvat-ai/cvat) locally. Its video Track mode automatically interpolates boxes between keyframes and supports keyframe edits, `Outside` states, track splitting, and track merging. Its native track format stores per-frame boxes with fields such as `occluded`, `outside`, and `keyframe`; this maps directly to the observations produced by this repository. [CVAT Track mode](https://docs.cvat.ai/docs/manual/advanced/track-mode-advanced/), [CVAT format](https://docs.cvat.ai/docs/manual/advanced/formats/format-cvat/)
 
-CVAT Community is MIT-licensed, self-hostable, and keeps the video in the local annotation environment. Its automatic-annotation interface can also run a custom tracking function under your control. A future adapter could implement CVAT's tracking-function protocol with `spec`, `init_tracking_state`, and `track`; importing reviewed preannotations is simpler for the first iteration. [CVAT auto-annotation API](https://docs.cvat.ai/docs/api_sdk/sdk/auto-annotation/)
+CVAT Community is MIT-licensed, self-hostable, and keeps the video in the local annotation environment. This repository now exports and imports CVAT video XML using a source-hashed `task-frame-map.json` sidecar. The sidecar maps each CVAT task frame to the original zero-based source frame and integer source PTS, and records any crop and resize transform. CVAT task-local frame numbering alone is never treated as source numbering. Its automatic-annotation interface can also run a custom tracking function under your control. [CVAT auto-annotation API](https://docs.cvat.ai/docs/api_sdk/sdk/auto-annotation/)
 
 ### SAM 2: targeted propagation and mask refinement
 
@@ -64,13 +64,86 @@ UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
   --manual-cut 712
 ```
 
-The run produces `detections.jsonl`, `observations.csv`, `observations.parquet`, `trajectories.csv`, and `annotated.mp4`. The future CVAT adapter should read `observations.csv` and create one `source="auto"` CVAT track per `tracklet_id`. Use `tracklet_id` as the proposal identity because the current `player_id` is deterministic per tracklet and cross-view replay identity is intentionally unresolved.
+The run produces `detections.jsonl`, `observations.csv`, `observations.parquet`, `trajectories.csv`, and `annotated.mp4`. Export one shot or bounded review interval to CVAT:
 
-The converter should preserve original frame numbers and boxes, attach the detector score as an attribute, and mark a box as a keyframe when a track starts, ends, changes sharply, or crosses an occlusion boundary. It should never silently discard detector candidates or rewrite the raw cache.
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/export_cvat.py \
+  --observations artifacts/game-001/observations.csv \
+  --source data/game-001.mp4 \
+  --shot-id shot-12 --start-frame 12000 --end-frame 13350 \
+  --review-pack artifacts/game-001/review-pack.json \
+  --frame-map-output artifacts/game-001/shot-12-task-frame-map.json \
+  --output artifacts/game-001/shot-12-cvat-bundle.zip \
+  --cvat-xml-output artifacts/game-001/shot-12-annotations.xml
+```
+
+Import the standalone XML into a local CVAT video task created from that exact source interval with frame step 1. The ZIP bundle is for repository round-tripping; it includes both XML and the sidecar. If the task uses a crop or resize, pass the matching `--crop x1,y1,x2,y2` and `--task-size WIDTHxHEIGHT` when exporting, and prepare the CVAT media with the same transform. The task map binds every local frame to source PTS and maps edited boxes and points back to original 1920×1080 coordinates. The exporter breaks proposal tracks across long unobserved gaps and marks all boxes and track attributes as proposals. With `--review-pack`, Hough-line intersection hints are exported as unreviewed `field_landmark` point tracks; reviewers assign each semantic landmark ID and `fit` or `withheld` role before those points enter calibration.
+
+After human review, import the corrected CVAT XML plus its sidecar into the repository manifest:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/import_cvat.py \
+  --input artifacts/game-001/shot-12-reviewed.zip \
+  --frame-map artifacts/game-001/shot-12-task-frame-map.json \
+  --source data/game-001.mp4 \
+  --shot shot-12:12000:13350:sideline:play-0042:development \
+  --output artifacts/game-001/shot-12-annotations.json
+```
+
+The importer verifies source hash, dimensions, frame count, time base, exact PTS, and crop mapping. It emits `reviewed: false` by default. Use `--mark-reviewed --reviewer NAME --revision N --reviewed-at ISO_TIMESTAMP --annotation-confidence 1.0` only after checking every imported shape and frame tag in CVAT; the confidence value must be between 0 and 1. A proposal import cannot become evaluation truth by itself.
+
+The exporter also creates unreviewed `ground_contact` point tracks at each proposal box's bottom center. In CVAT, correct each point to the visible ground contact and set a confidence. Pass the valid calibration timeline to `scripts/build_reviewed_reference.py --calibration` to project reviewed source pixels into field yards.
+
+Only enter a `global_id` after the second reviewer checks the candidate. In the player track's attributes, set `cross_shot_review_status=approved`, the agreed `global_id`, and the second reviewer's name, timestamp, revision, and confidence. Use `ambiguous` or `rejected` with no meaningful `global_id` when the evidence does not support a link. The importer refuses to promote a reviewed global identity without the independent review metadata.
+
+Use `tracklet_id` as the proposal identity because the current `player_id` is deterministic per tracklet and cross-view replay identity is intentionally unresolved.
+
+The converter preserves original frame numbers and boxes, attaches detector score and team suggestions as attributes, and emits observed boxes as keyframes. It does not silently discard detections or rewrite the raw cache.
+
+### Source-addressed identity cues and review queues
+
+Tesseract can propose jersey readings from crops that are large enough to inspect. OCR output stays unreviewed, retains source frame/PTS and the exact crop box, and is tied to the source video and base detector/tracker analysis hash:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/propose_jersey_reads.py \
+  --source data/game-001.mp4 \
+  --observations artifacts/game-001/observations.csv \
+  --analysis-config artifacts/game-001/analysis-config.json \
+  --output artifacts/game-001/jersey-cues.json
+```
+
+Use the cue file on a matching rerun with `--identity-cues`. The pipeline verifies each cue's tracklet, frame, PTS, and box against the current observations. Unreviewed jersey and appearance cues only change review ranking. A jersey conflict becomes a hard candidate rejection only after a reliable jersey value is explicitly marked reviewed or accepted. These cues do not assign `global_id` values by themselves.
+
+Create a side-by-side identity review queue from a run:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/build_identity_review_queue.py \
+  --identity-links artifacts/game-001/identity-links.json \
+  --observations artifacts/game-001/observations.csv \
+  --source data/game-001.mp4 \
+  --output artifacts/game-001/identity-review-queue.json \
+  --contact-sheet artifacts/game-001/identity-review-contact-sheet.jpg
+```
+
+The queue orders accepted links, close alternatives, rejected edges, and unmatched tracklets for inspection. Every sample includes source frame, source PTS, box, team, calibration status, and aligned play time where available. The contact sheet is an aid; the JSON source coordinates and original video remain authoritative.
+
+`scripts/build_play_inventory.py` emits overlapping adjacent-shot play-window proposals alongside candidate cuts. These windows only prioritize review; confirm every camera transition and play grouping manually.
+
+For a bounded source window, propose motion-burst frames to inspect for timing events and candidate camera-motion keyframes:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/propose_timing_events.py \
+  --source data/game-001.mp4 --start-frame 12000 --end-frame 13350 \
+  --output artifacts/game-001/shot-12-event-proposals.json
+```
+
+These proposals only identify motion changes or possible camera movement. Reviewers assign `pre_snap`, `snap`, and `ball_release` labels and fit the PTS map from reviewed correspondences, with separate held-out events. They do not produce a reviewed alignment or valid calibration.
 
 ### 3. Review in CVAT
 
-Create a label schema with `player`, `official`, and `football`. Add attributes for `team` (`DET`, `LAR`, or `unknown`), `occluded`, `visibility`, `jersey_readable`, and `review_status`. Keep team and role as attributes rather than detector classes when the goal is to generalize to new teams.
+Create a label schema with `player`, `official`, `football`, `ground_contact` points, and `field_landmark` points. Add player attributes for `team` (`DET`, `LAR`, or `unknown`), `visibility`, `jersey_readable`, `review_status`, `global_id`, and `cross_shot_review_status`. Add `identity_second_reviewer`, `identity_second_reviewed_at`, `identity_second_revision`, and `identity_second_confidence` for every reviewed cross-shot decision. Keep team and role as attributes rather than detector classes when the goal is to generalize to new teams.
+
+For `ground_contact`, keep `tracklet_id` and `ground_contact_confidence`; for `field_landmark`, use the semantic `landmark_id` and `role` (`fit` or `withheld`). These attributes are declared in exported XML; configure them in the CVAT task schema before editing if CVAT asks for existing label definitions.
 
 Review in this order:
 
@@ -109,20 +182,22 @@ Fine-tune RF-DETR on the reviewed COCO/YOLO export. Re-run the same clips with c
 
 The acceptance report should include visible-player precision and recall, HOTA, IDF1, fragmentation, ID switches, team-label accuracy and coverage, and failure examples. The [evaluation plan](evaluation-plan.md) contains proposed gates; the Roboflow tutorial's reported metrics are not substitutes for this project's held-out measurements.
 
-## Repository changes that make this workflow easy
+## Repository components for this workflow
 
 The versioned annotation contract is documented in [annotation-schema.md](annotation-schema.md).
-Use `scripts/build_identity_review_pack.py` to extract exact, original-resolution frames
-and detector proposals. Its output is an unreviewed proposal pack; it cannot be passed to
-the evaluation loader until a human has filled the shot, split, landmark, contact, and
-identity fields and marked the manifest reviewed.
+Use `scripts/build_identity_review_pack.py` to extract exact, original-resolution frames,
+source PTS, detector proposals, field-line intersections, and box-bottom contact hints.
+Intersection semantics and contact confidence remain human decisions. Its output is an
+unreviewed proposal pack; it cannot be passed to the evaluation loader until a human has
+filled the shot, split, landmark, contact, and identity fields and marked the manifest
+reviewed.
 
-The current code already has a clean seam for an annotation adapter. The next small additions should be:
+The current implementation includes these source-addressed components:
 
-- `src/football_tracking/cvat.py`: serialize and parse reviewed CVAT tracks;
-- `scripts/export_cvat.py`: convert a run's `observations.csv` into CVAT preannotations;
-- `scripts/import_cvat.py`: convert corrected tracks into COCO/YOLO and MOT-style ground truth;
-- `docs/annotation-schema.md`: freeze labels, attributes, visibility rules, and split policy;
-- an active-learning report that emits the frame list above from detector and tracker uncertainty.
+- `src/football_tracking/cvat.py`: source-hashed task-frame maps, CVAT video XML, and source-coordinate conversion;
+- `scripts/export_cvat.py` and `scripts/import_cvat.py`: source-addressed proposal export and reviewed-manifest import;
+- `scripts/propose_jersey_reads.py`: optional local OCR proposals tied to exact crops;
+- `scripts/build_identity_review_queue.py`: source-addressed identity case ordering and contact sheets;
+- `scripts/propose_timing_events.py`: bounded optical-flow motion-burst proposals for human event review.
 
-Until those adapters exist, do not hand-edit `observations.csv` as a substitute for an annotation record. Keep reviewed corrections in a versioned overlay so raw inference can be reproduced and compared.
+Use the CVAT importer to retain corrected annotations as a source-addressed manifest; do not hand-edit `observations.csv` as a substitute for an annotation record. Keep reviewed corrections in a versioned overlay so raw inference can be reproduced and compared.

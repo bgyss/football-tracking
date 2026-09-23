@@ -69,6 +69,42 @@ def _validate_review_metadata(raw: Mapping[str, Any], label: str) -> None:
         raise AnnotationError(f"{label} annotation_confidence must be between 0 and 1")
 
 
+def _validate_identity_review_metadata(raw: Mapping[str, Any], label: str) -> None:
+    status = str(raw.get("cross_shot_review_status", "")).strip()
+    raw_global_id = raw.get("global_id", raw.get("cross_shot_id"))
+    global_id = str(raw_global_id).strip() if raw_global_id is not None else ""
+    meaningful_id = global_id.lower() not in {"", "unknown", "ambiguous", "unresolved"}
+    if meaningful_id and status != "approved":
+        raise AnnotationError(f"{label} global_id requires cross_shot_review_status: approved")
+    if not status:
+        return
+    if status not in {"approved", "ambiguous", "rejected"}:
+        raise AnnotationError(f"{label} has unsupported cross_shot_review_status")
+    if status == "approved" and not meaningful_id:
+        raise AnnotationError(f"{label} approved cross-shot review needs a global_id")
+    if status in {"ambiguous", "rejected"} and meaningful_id:
+        raise AnnotationError(f"{label} {status} cross-shot review cannot assign a global_id")
+    second_reviewer = str(raw.get("identity_second_reviewer", "")).strip()
+    if not second_reviewer or second_reviewer.casefold() == str(raw.get("reviewer", "")).strip().casefold():
+        raise AnnotationError(f"{label} cross-shot decision needs an independent second reviewer")
+    second_reviewed_at = str(raw.get("identity_second_reviewed_at", "")).strip()
+    try:
+        timestamp = datetime.fromisoformat(second_reviewed_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise AnnotationError(f"{label} identity_second_reviewed_at must be an ISO-8601 timestamp") from error
+    if timestamp.tzinfo is None:
+        raise AnnotationError(f"{label} identity_second_reviewed_at must include a timezone")
+    try:
+        second_revision = int(raw.get("identity_second_revision", 0))
+        second_confidence = float(raw.get("identity_second_confidence"))
+    except (TypeError, ValueError) as error:
+        raise AnnotationError(f"{label} second-review metadata is incomplete") from error
+    if second_revision <= 0:
+        raise AnnotationError(f"{label} identity_second_revision must be positive")
+    if not math.isfinite(second_confidence) or not 0.0 <= second_confidence <= 1.0:
+        raise AnnotationError(f"{label} identity_second_confidence must be between zero and one")
+
+
 def _box(value: Any) -> tuple[float, float, float, float]:
     try:
         result = tuple(float(item) for item in value)
@@ -169,13 +205,42 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
             box = _box(raw["bbox_xyxy_px"])
             if box[0] < 0 or box[1] < 0 or box[2] > width or box[3] > height:
                 raise AnnotationError(f"annotation {annotation_id} bbox lies outside source image")
+        if "ground_contact_xy_px" in raw:
+            try:
+                contact_px = tuple(float(item) for item in raw["ground_contact_xy_px"])
+            except (TypeError, ValueError) as error:
+                raise AnnotationError(f"annotation {annotation_id} ground_contact_xy_px must contain numeric coordinates") from error
+            if len(contact_px) != 2 or not all(math.isfinite(item) for item in contact_px) or not 0.0 <= contact_px[0] <= width or not 0.0 <= contact_px[1] <= height:
+                raise AnnotationError(f"annotation {annotation_id} ground_contact_xy_px lies outside source image")
+            if require_reviewed and raw.get("ground_contact_confidence") is None:
+                raise AnnotationError(f"annotation {annotation_id} needs ground_contact_confidence for a reviewed contact point")
+        if raw.get("ground_contact_confidence") is not None:
+            try:
+                contact_confidence = float(raw["ground_contact_confidence"])
+            except (TypeError, ValueError) as error:
+                raise AnnotationError(f"annotation {annotation_id} has invalid ground_contact_confidence") from error
+            if not math.isfinite(contact_confidence) or not 0.0 <= contact_confidence <= 1.0:
+                raise AnnotationError(f"annotation {annotation_id} ground_contact_confidence must be between zero and one")
         if raw.get("coordinate_space", "source") != "source":
             raise AnnotationError(f"annotation {annotation_id} must be converted to source coordinates before review")
         if require_reviewed and raw.get("review_status") not in {"reviewed", "accepted"}:
             raise AnnotationError(f"annotation {annotation_id} is not reviewed")
         if require_reviewed:
             _validate_review_metadata(raw, f"annotation {annotation_id}")
+            _validate_identity_review_metadata(raw, f"annotation {annotation_id}")
         annotations.append(dict(raw))
+    identity_decisions: dict[tuple[str, str], tuple[str, str]] = {}
+    for raw in annotations:
+        status = str(raw.get("cross_shot_review_status", "")).strip()
+        raw_global_id = raw.get("global_id", raw.get("cross_shot_id"))
+        if not status and raw_global_id is None:
+            continue
+        object_id = str(raw.get("track_id") or raw.get("id") or "").strip()
+        decision = (status, str(raw_global_id or "").strip().lower())
+        key = (str(raw["shot_id"]), object_id)
+        previous = identity_decisions.setdefault(key, decision)
+        if previous != decision:
+            raise AnnotationError(f"track {key[0]}:{key[1]} has conflicting cross-shot review decisions")
     raw_landmarks = value.get("landmarks", [])
     if not isinstance(raw_landmarks, list):
         raise AnnotationError("landmarks must be a list")
@@ -306,7 +371,7 @@ def manifest_template_from_review_pack(pack: Mapping[str, Any], shots: Mapping[s
     return {"schema_version": 1, "reviewed": False, "source": dict(source), "shots": normalized_shots, "annotations": [], "landmarks": [], "frame_labels": [], "review_frames": list(pack.get("frames", [])), "review_policy": "Fill and review all labels, then set reviewed=true."}
 
 
-def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
+def mot_reference_from_manifest(manifest: AnnotationManifest, calibration_timeline: Any = None) -> dict[str, Any]:
     """Convert a reviewed annotation manifest into the evaluator reference contract.
 
     Player annotations use ``track_id`` (falling back to ``id``) as the
@@ -327,6 +392,8 @@ def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
     frame_pts: dict[tuple[str, int], int] = {}
     seen_objects: set[tuple[str, int, str]] = set()
     for raw in manifest.annotations:
+        if str(raw.get("label", "player")) != "player":
+            continue
         shot_id = str(raw["shot_id"])
         frame_index = int(raw["source_frame"])
         pts = int(raw["pts"])
@@ -357,6 +424,41 @@ def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
                     object_value["ground_contact_confidence"] = float(raw["ground_contact_confidence"])
                 except (TypeError, ValueError) as error:
                     raise AnnotationError(f"annotation {raw.get('id', '<unknown>')} has invalid ground contact confidence") from error
+            object_value["ground_contact_projection_status"] = "reviewed_field_coordinate"
+        elif raw.get("ground_contact_xy_px") is not None:
+            object_value["ground_contact_projection_status"] = "not_requested" if calibration_timeline is None else "calibration_unavailable"
+            if raw.get("ground_contact_confidence") is not None:
+                object_value["ground_contact_confidence"] = float(raw["ground_contact_confidence"])
+            if calibration_timeline is not None:
+                estimate = calibration_timeline.at(shot_id, pts)
+                if estimate is not None:
+                    object_value["ground_contact_projection_status"] = estimate.status
+                    if estimate.identity_eligible:
+                        try:
+                            import cv2
+                            import numpy as np
+
+                            point_xy = tuple(float(item) for item in raw["ground_contact_xy_px"])
+                            if len(estimate.support_polygon_px) < 3:
+                                object_value["ground_contact_projection_status"] = "calibration_support_missing"
+                                point_xy = ()
+                            else:
+                                polygon = np.asarray(estimate.support_polygon_px, dtype=np.float32).reshape(-1, 1, 2)
+                                if cv2.pointPolygonTest(polygon, point_xy, False) < 0:
+                                    object_value["ground_contact_projection_status"] = "outside_calibration_support"
+                                    point_xy = ()
+                            if point_xy:
+                                from .calibration import ImagePoint
+
+                                projected = estimate.homography.project(ImagePoint(*point_xy))
+                                if projected is None:
+                                    object_value["ground_contact_projection_status"] = "projection_invalid"
+                                else:
+                                    object_value["ground_contact_xy_yards"] = [projected.x_yards, projected.y_yards]
+                                    object_value["ground_contact_projection_status"] = "projected"
+                                    object_value["calibration_id"] = estimate.calibration_id
+                        except (TypeError, ValueError) as error:
+                            raise AnnotationError(f"annotation {raw.get('id', '<unknown>')} has invalid ground contact pixel coordinates") from error
         grouped.setdefault(shot_id, {}).setdefault(frame_index, []).append(object_value)
         global_id = raw.get("global_id", raw.get("cross_shot_id"))
         if global_id is not None and str(global_id).strip().lower() not in {"", "unknown", "ambiguous", "unresolved"}:

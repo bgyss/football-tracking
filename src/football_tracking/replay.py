@@ -16,6 +16,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .identity import TeamEvidence
+from .identity_cues import TrackletCues, compare_tracklet_cues
 
 
 class ReplayAlignmentError(ValueError):
@@ -449,6 +450,7 @@ def cross_shot_candidate_evidence(
     sample_tolerance_s: float = 0.05,
     min_overlap_duration_s: float = 0.4,
     max_position_uncertainty_yards: float = 2.0,
+    tracklet_cues: Mapping[str, TrackletCues] | None = None,
 ) -> dict[tuple[str, str], dict[str, object]]:
     """Return auditable evidence for every possible cross-shot pair.
 
@@ -485,11 +487,22 @@ def cross_shot_candidate_evidence(
                 "right_team": None,
                 "left_team_score": left_team.score if left_team is not None else 0.0,
                 "right_team_score": 0.0,
+                "identity_cues": {},
+                "review_rank_score": None,
                 "rejection_reason": None,
             }
             right_team = teams.get(right_track.tracklet_id)
             record["right_team"] = right_team.team if right_team is not None else "unknown"
             record["right_team_score"] = right_team.score if right_team is not None else 0.0
+            cue_evidence = compare_tracklet_cues(
+                tracklet_cues.get(left_track.tracklet_id) if tracklet_cues is not None else None,
+                tracklet_cues.get(right_track.tracklet_id) if tracklet_cues is not None else None,
+            )
+            record["identity_cues"] = cue_evidence
+            if cue_evidence["reviewed_jersey_conflict"]:
+                record["rejection_reason"] = "reviewed_jersey_mismatch"
+                evidence[key] = record
+                continue
             if left_team is None or not left_team.eligible:
                 record["rejection_reason"] = "left_team_ineligible"
                 evidence[key] = record
@@ -545,6 +558,8 @@ def cross_shot_candidate_evidence(
             uncertainty_penalty = float(np.exp(-np.median(uncertainties) / max(1e-6, max_position_uncertainty_yards))) if uncertainties.size and max_position_uncertainty_yards > 0 else 1.0
             score = (0.55 * position + 0.30 * shape + 0.15 * team_confidence) * uncertainty_penalty
             record["score"] = max(0.0, min(1.0, score))
+            cue_score = cue_evidence.get("review_rank_score")
+            record["review_rank_score"] = round(0.75 * float(record["score"]) + 0.25 * float(cue_score), 6) if cue_score is not None else record["score"]
             record["eligible"] = True
             evidence[key] = record
     return evidence
