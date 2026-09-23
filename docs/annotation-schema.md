@@ -18,6 +18,7 @@ has corrected it and explicitly marked it reviewed.
   },
   "shots": {
     "shot-0": {
+      "source_shot_id": "shot-0",
       "start_frame": 1200,
       "end_frame": 1450,
       "play_id": "game-001-play-0042",
@@ -34,6 +35,7 @@ has corrected it and explicitly marked it reviewed.
       "bbox_xyxy_px": [100, 200, 130, 300],
       "label": "player",
       "track_id": "cvat-17",
+      "source_shot_id": "shot-0",
       "global_id": "anon-player-0003",
       "team": "DET",
       "visibility": "partially_visible",
@@ -123,13 +125,16 @@ are omitted because they have no visible box to score.
 replay views. `play_time_s` is a reviewed play-relative time; it never replaces or
 rewrites the media PTS. In CVAT video XML, timing events are `timing_event` point tracks
 with `event`, `play_id`, `correspondence_id`, `play_time_s`, and `source_pts` attributes.
+Only explicit point keyframes (`keyframe="1"`) become timing events; interpolated
+non-keyframes are not independent anchors.
 
 Landmarks use `image_xy_px`, `field_xy_yards`, `source_frame`, and `pts`; `role` is `fit`
 or `withheld`. Each keyframe needs at least four fit landmarks and one independent
 withheld landmark to form a schema-v2 calibration timeline. A semantic `landmark_id`,
 such as `yardline:20:hash:near`, is checked against its canonical field coordinate.
 CVAT represents these as `calibration_landmark` point tracks with the field coordinates,
-semantic ID, and fit/withheld role as attributes.
+semantic ID, and fit/withheld role as attributes. Only explicit landmark keyframes are
+imported.
 
 Field landmarks use a fixed orientation: x=0 is the west end line, x=120 is the east end
 line, and y=0 is the near sideline. The field is 120 by 53 1/3 yards, with goal lines at
@@ -158,8 +163,10 @@ format](https://docs.cvat.ai/docs/manual/advanced/formats/format-cvat/).
 and dimensions match the sidecar, resolves each PTS from the verified source frame index,
 preserves frame numbers, and writes both
 `annotations.json` and `mot-reference.json`. A box's original inference row is retained
-under `inference_provenance` when its shot, frame, and source tracklet still match. New
-human-added boxes have no fabricated inference provenance. Only reviewed `player`
+under `inference_provenance` when its immutable source run, source shot, frame, and source
+tracklet still match. The reviewed `shot_id` can change while `source_shot_id` preserves
+the original inference namespace. New human-added boxes have no fabricated inference
+provenance. Only reviewed `player`
 objects enter the MOT-style reference; officials, football, timing events, and landmarks
 stay in the annotation manifest.
 

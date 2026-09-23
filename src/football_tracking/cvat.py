@@ -76,6 +76,13 @@ def _attribute_definition(
 
 
 def _add_cvat_labels(parent: ET.Element, teams: Sequence[str]) -> None:
+    immutable_source_fields = {
+        "source_shot_id",
+        "source_run_id",
+        "source_tracklet_id",
+        "source_parent_tracklet_id",
+        "proposal_player_id",
+    }
     common = (
         ("shot_id", "text", "", ()),
         ("source_shot_id", "text", "", ()),
@@ -123,7 +130,14 @@ def _add_cvat_labels(parent: ET.Element, teams: Sequence[str]) -> None:
         ET.SubElement(label, "type").text = shape_type
         attributes_node = ET.SubElement(label, "attributes")
         for attribute_name, input_type, default, values in attributes:
-            _attribute_definition(label, attribute_name, input_type, default=default, values=values)
+            _attribute_definition(
+                label,
+                attribute_name,
+                input_type,
+                default=default,
+                values=values,
+                mutable=attribute_name not in immutable_source_fields,
+            )
 
 
 def _normalized_source(source: Mapping[str, Any]) -> dict[str, Any]:
@@ -150,12 +164,13 @@ def _normalized_shots(shots: Mapping[str, Mapping[str, Any]], frame_count: int) 
     for shot_id, raw in sorted(shots.items()):
         start = _as_int(raw.get("start_frame"), f"{shot_id} start_frame")
         end = _as_int(raw.get("end_frame"), f"{shot_id} end_frame")
-        if not shot_id.strip() or start < 0 or end <= start or end > frame_count:
+        source_shot_id = str(raw.get("source_shot_id", shot_id)).strip()
+        if not shot_id.strip() or not source_shot_id or start < 0 or end <= start or end > frame_count:
             raise CvatBridgeError(f"shot {shot_id!r} has an invalid source-frame interval")
         result[str(shot_id)] = {
             "start_frame": start,
             "end_frame": end,
-            "source_shot_id": str(raw.get("source_shot_id", shot_id)),
+            "source_shot_id": source_shot_id,
             "play_id": None if raw.get("play_id") in (None, "") else str(raw["play_id"]),
             "split": str(raw.get("split", "unassigned")),
             "camera_label": str(raw.get("camera_label", "unknown")),
@@ -386,17 +401,32 @@ def import_cvat_manifest(
     # CVAT exports track properties on each tracked shape. The source converter
     # also emits them there, so track-level attributes are accepted for hand-built
     # or older XML but shape-level values take precedence.
+    run_info = provenance.get("run")
+    expected_run_id = str(run_info.get("run_id", "")) if isinstance(run_info, Mapping) else ""
     raw_observations = provenance.get("observation_provenance", [])
     if not isinstance(raw_observations, list):
         raise CvatBridgeError("observation_provenance must be a list")
-    provenance_index: dict[tuple[str, int, str], Mapping[str, Any]] = {}
+    if raw_observations and not expected_run_id:
+        raise CvatBridgeError("CVAT provenance sidecar has observation rows but no run_id")
+    provenance_index: dict[tuple[str, str, int, str], Mapping[str, Any]] = {}
     for item in raw_observations:
         if not isinstance(item, Mapping) or not isinstance(item.get("raw_row"), Mapping):
             raise CvatBridgeError("invalid raw observation provenance entry")
-        key = (str(item.get("shot_id", "")), _as_int(item.get("source_frame"), "provenance source_frame"), str(item.get("tracklet_id", "")))
+        raw_row = item["raw_row"]
+        run_id = str(raw_row.get("run_id", ""))
+        source_shot_id = str(item.get("source_shot_id") or raw_row.get("shot_id", ""))
+        frame = _as_int(item.get("source_frame"), "provenance source_frame")
+        tracklet_id = str(item.get("tracklet_id", ""))
+        if expected_run_id and run_id != expected_run_id:
+            raise CvatBridgeError("raw observation provenance run_id does not match its sidecar run")
+        if not run_id or not source_shot_id or not tracklet_id:
+            raise CvatBridgeError("raw observation provenance needs run, source shot, and tracklet ids")
+        if raw_row.get("shot_id") != source_shot_id or _as_int(raw_row.get("frame_index"), "raw observation frame_index") != frame or raw_row.get("tracklet_id") != tracklet_id:
+            raise CvatBridgeError("raw observation provenance keys do not match the original CSV row")
+        key = (run_id, source_shot_id, frame, tracklet_id)
         if key in provenance_index:
             raise CvatBridgeError("duplicate raw observation provenance entry")
-        provenance_index[key] = item["raw_row"]
+        provenance_index[key] = raw_row
 
     annotations: list[dict[str, Any]] = []
     landmarks: list[dict[str, Any]] = []
@@ -415,6 +445,13 @@ def import_cvat_manifest(
                 continue
             if shape.get("outside", "0") == "1":
                 continue
+            if label in {"calibration_landmark", "timing_event"}:
+                if shape.tag != "points":
+                    raise CvatBridgeError(f"CVAT {label} track {cvat_id} must use points shapes")
+                if shape.get("keyframe") == "0":
+                    continue
+                if shape.get("keyframe") != "1":
+                    raise CvatBridgeError(f"CVAT {label} point at source frame {shape.get('frame')} must declare keyframe=1")
             attributes = {**track_attributes, **_attribute_values(shape)}
             try:
                 frame = _as_int(shape.get("frame"), "CVAT source frame")
@@ -433,8 +470,6 @@ def import_cvat_manifest(
             pts = _shape_pts(frame, attributes, pts_by_frame, source["frame_count"])
             record_id = f"{shot_id}:{frame}:{track_id}"
             if label == "timing_event":
-                if shape.tag != "points":
-                    raise CvatBridgeError(f"CVAT timing_event track {cvat_id} must use points shapes")
                 point_pairs = str(shape.get("points", "")).split(";")
                 point_values = point_pairs[0].split(",") if len(point_pairs) == 1 else []
                 if len(point_values) != 2:
@@ -492,7 +527,16 @@ def import_cvat_manifest(
             except CvatBridgeError:
                 raise
             source_tracklet_id = attributes.get("source_tracklet_id", "")
-            raw_row = provenance_index.get((shot_id, frame, source_tracklet_id)) if source_tracklet_id else None
+            source_run_id = attributes.get("source_run_id", "")
+            source_shot_id = attributes.get("source_shot_id", "")
+            lineage_fields = (source_run_id, source_shot_id, source_tracklet_id)
+            if any(lineage_fields) and not all(lineage_fields):
+                raise CvatBridgeError(f"CVAT track {cvat_id} has incomplete inference provenance identifiers")
+            if source_run_id and expected_run_id and source_run_id != expected_run_id:
+                raise CvatBridgeError(f"CVAT track {cvat_id} source_run_id does not match the provenance sidecar")
+            raw_row = None
+            if source_run_id and source_shot_id and source_tracklet_id:
+                raw_row = provenance_index.get((source_run_id, source_shot_id, frame, source_tracklet_id))
             occluded = shape.get("occluded", "0") == "1"
             visibility = attributes.get("visibility", "visible")
             if visibility == "out_of_frame":
