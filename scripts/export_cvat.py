@@ -25,6 +25,33 @@ def _read_json(path: Path) -> dict:
 
 
 def _shot_metadata(value: dict, frame_count: int, play_id: str | None, pts_by_frame: Sequence[int]) -> dict[str, dict[str, object]]:
+    segments = value.get("segments")
+    if isinstance(segments, list) and segments:
+        result: dict[str, dict[str, object]] = {}
+        for index, raw in enumerate(segments):
+            if not isinstance(raw, dict):
+                raise CvatBridgeError(f"shots.json segment {index} must be an object")
+            shot_id = str(raw.get("shot_id", "")).strip()
+            source_shot_id = str(raw.get("source_shot_id", shot_id)).strip()
+            try:
+                start, end = int(raw["start_frame"]), int(raw["end_frame"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise CvatBridgeError(f"shots.json segment {index} needs start_frame/end_frame") from error
+            if not shot_id or not source_shot_id or start < 0 or end <= start or end > frame_count:
+                raise CvatBridgeError(f"shots.json segment {index} has invalid source-frame metadata")
+            if shot_id in result:
+                raise CvatBridgeError(f"shots.json contains duplicate effective shot id {shot_id!r}")
+            result[shot_id] = {
+                "source_shot_id": source_shot_id,
+                "start_frame": start,
+                "end_frame": end,
+                "play_id": raw.get("play_id", play_id),
+                "split": "unassigned",
+                "camera_label": "unknown",
+                "start_pts": pts_by_frame[start] if start < len(pts_by_frame) else None,
+            }
+        return result
+
     ranges = value.get("ranges")
     if not isinstance(ranges, list) or not ranges:
         raise CvatBridgeError("shots.json must contain non-empty source-frame ranges")

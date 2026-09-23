@@ -14,8 +14,7 @@ class CvatBridgeError(ValueError):
 
 
 _OBJECT_LABELS = {"player", "official", "football"}
-_ANNOTATION_LABELS = _OBJECT_LABELS | {"calibration_landmark"}
-_TAG_LABELS = {"timing_event", "shot_boundary"}
+_TRACK_LABELS = _OBJECT_LABELS | {"calibration_landmark", "timing_event"}
 
 
 def _as_int(value: Any, label: str) -> int:
@@ -79,6 +78,7 @@ def _attribute_definition(
 def _add_cvat_labels(parent: ET.Element, teams: Sequence[str]) -> None:
     common = (
         ("shot_id", "text", "", ()),
+        ("source_shot_id", "text", "", ()),
         ("source_run_id", "text", "", ()),
         ("source_tracklet_id", "text", "", ()),
         ("source_parent_tracklet_id", "text", "", ()),
@@ -108,20 +108,19 @@ def _add_cvat_labels(parent: ET.Element, teams: Sequence[str]) -> None:
         ("correspondence_id", "text", "", ()),
         ("play_time_s", "number", "", ()),
         ("source_pts", "text", "", ()),
+        ("review_status", "select", "unreviewed", ("unreviewed", "reviewed", "accepted", "rejected")),
     )
-    boundary = (
-        ("shot_id", "text", "", ()),
-        ("boundary", "select", "start", ("start",)),
-        ("end_frame_exclusive", "text", "", ()),
-        ("play_id", "text", "", ()),
-        ("split", "text", "unassigned", ()),
-        ("camera_label", "text", "unknown", ()),
-        ("source_pts", "text", "", ()),
-    )
-    definitions = {"player": common, "official": common, "football": common, "calibration_landmark": landmark, "timing_event": event, "shot_boundary": boundary}
-    for name, attributes in definitions.items():
+    definitions = {
+        "player": ("bbox", common),
+        "official": ("bbox", common),
+        "football": ("bbox", common),
+        "calibration_landmark": ("points", landmark),
+        "timing_event": ("points", event),
+    }
+    for name, (shape_type, attributes) in definitions.items():
         label = ET.SubElement(parent, "label")
         ET.SubElement(label, "name").text = name
+        ET.SubElement(label, "type").text = shape_type
         attributes_node = ET.SubElement(label, "attributes")
         for attribute_name, input_type, default, values in attributes:
             _attribute_definition(label, attribute_name, input_type, default=default, values=values)
@@ -156,6 +155,7 @@ def _normalized_shots(shots: Mapping[str, Mapping[str, Any]], frame_count: int) 
         result[str(shot_id)] = {
             "start_frame": start,
             "end_frame": end,
+            "source_shot_id": str(raw.get("source_shot_id", shot_id)),
             "play_id": None if raw.get("play_id") in (None, "") else str(raw["play_id"]),
             "split": str(raw.get("split", "unassigned")),
             "camera_label": str(raw.get("camera_label", "unknown")),
@@ -198,7 +198,7 @@ def build_cvat_preannotations(
     for raw_value in observations:
         raw = {str(key): str(value) for key, value in raw_value.items()}
         try:
-            shot_id = raw["shot_id"]
+            source_shot_id = raw["shot_id"]
             frame = _as_int(raw["frame_index"], "observation frame_index")
             pts = _as_int(raw["pts"], "observation pts")
             tracklet_id = raw["tracklet_id"].strip()
@@ -207,8 +207,15 @@ def build_cvat_preannotations(
             team_score = _as_float(raw.get("team_score", "0"), "observation team_score")
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise CvatBridgeError(f"invalid observation row: {error}") from error
+        matching_shots = [
+            (shot_id, shot)
+            for shot_id, shot in normalized_shots.items()
+            if shot["source_shot_id"] == source_shot_id and shot["start_frame"] <= frame < shot["end_frame"]
+        ]
+        if len(matching_shots) != 1:
+            raise CvatBridgeError(f"observation {source_shot_id}:{frame} maps to {len(matching_shots)} declared shot segments")
+        shot_id, shot = matching_shots[0]
         key = (shot_id, frame, tracklet_id)
-        shot = normalized_shots.get(shot_id)
         if not tracklet_id or key in seen:
             raise CvatBridgeError("observation has an empty tracklet id or a duplicate source frame")
         seen.add(key)
@@ -236,7 +243,7 @@ def build_cvat_preannotations(
         observed_teams.add(team)
         value = {"raw_row": raw, "bbox": bbox, "frame": frame, "pts": pts, "team": team, "team_score": team_score, "score": score}
         grouped[(shot_id, tracklet_id)].append(value)
-        provenance_rows.append({"shot_id": shot_id, "source_frame": frame, "tracklet_id": tracklet_id, "raw_row": raw})
+        provenance_rows.append({"shot_id": shot_id, "source_shot_id": source_shot_id, "source_frame": frame, "tracklet_id": tracklet_id, "raw_row": raw})
 
     root = ET.Element("annotations")
     ET.SubElement(root, "version").text = "1.1"
@@ -244,6 +251,9 @@ def build_cvat_preannotations(
     task = ET.SubElement(meta, "task")
     for name, value in (("id", "0"), ("name", f"football-tracking-{run_id}"), ("size", str(normalized_source["frame_count"])), ("mode", "interpolation"), ("overlap", "0"), ("start_frame", "0"), ("stop_frame", str(normalized_source["frame_count"] - 1)), ("frame_filter", ""), ("subset", "default")):
         ET.SubElement(task, name).text = value
+    original_size = ET.SubElement(task, "original_size")
+    ET.SubElement(original_size, "width").text = str(normalized_source["width"])
+    ET.SubElement(original_size, "height").text = str(normalized_source["height"])
     segments = ET.SubElement(task, "segments")
     segment = ET.SubElement(segments, "segment")
     ET.SubElement(segment, "id").text = "0"
@@ -257,13 +267,6 @@ def build_cvat_preannotations(
     ET.SubElement(assignee, "username").text = ""
     labels = ET.SubElement(task, "labels")
     _add_cvat_labels(labels, tuple(sorted(observed_teams)))
-
-    # A shot-boundary tag carries the exclusive end frame without shifting any
-    # CVAT frame number away from the source video's zero-based frame index.
-    for shot_id, shot in sorted(normalized_shots.items(), key=lambda item: (item[1]["start_frame"], item[0])):
-        tag = ET.SubElement(root, "tag", {"frame": str(shot["start_frame"]), "label": "shot_boundary"})
-        for name, value in (("shot_id", shot_id), ("boundary", "start"), ("end_frame_exclusive", shot["end_frame"]), ("play_id", shot["play_id"]), ("split", shot["split"]), ("camera_label", shot["camera_label"]), ("source_pts", shot.get("start_pts"))):
-            _add_attribute(tag, name, value)
 
     track_id = 0
     for (shot_id, tracklet_id), rows in sorted(grouped.items()):
@@ -279,6 +282,7 @@ def build_cvat_preannotations(
             })
             attributes = {
                 "shot_id": shot_id,
+                "source_shot_id": shot["source_shot_id"],
                 "source_run_id": run_id,
                 "source_tracklet_id": tracklet_id,
                 "source_parent_tracklet_id": raw.get("source_tracklet_id"),
@@ -325,18 +329,26 @@ def _shape_pts(frame: int, attributes: Mapping[str, str], pts_by_frame: Sequence
     source_value: int | None = None
     if pts_by_frame is not None and frame < len(pts_by_frame):
         source_value = _as_int(pts_by_frame[frame], f"source PTS for frame {frame}")
+        if source_value < 0:
+            raise CvatBridgeError(f"source PTS for frame {frame} is negative")
+        return source_value
     if declared not in (None, ""):
-        declared_value = _as_int(declared, f"CVAT source_pts for frame {frame}")
-        if source_value is not None and declared_value != source_value:
-            raise CvatBridgeError(f"CVAT PTS for source frame {frame} does not match the source video")
-        source_value = declared_value
+        source_value = _as_int(declared, f"CVAT source_pts for frame {frame}")
     if source_value is None or source_value < 0:
         raise CvatBridgeError(f"CVAT frame {frame} has no exact source PTS")
     return source_value
 
 
-def _review_fields(reviewer: str, reviewed_at: str) -> dict[str, Any]:
-    return {"review_status": "reviewed", "reviewer": reviewer, "revision": 1, "reviewed_at": reviewed_at, "annotation_confidence": 1.0}
+def _review_fields(reviewer: str, reviewed_at: str, status: str) -> dict[str, Any]:
+    return {"review_status": status, "reviewer": reviewer, "revision": 1, "reviewed_at": reviewed_at, "annotation_confidence": 1.0}
+
+
+def _shape_review_status(attributes: Mapping[str, str], label: str, frame: int) -> str:
+    status = attributes.get("review_status", "")
+    if status in {"reviewed", "accepted", "rejected"}:
+        return status
+    display_status = repr(status or "<missing>")
+    raise CvatBridgeError(f"CVAT {label} shape at source frame {frame} has review_status={display_status}")
 
 
 def import_cvat_manifest(
@@ -368,25 +380,8 @@ def import_cvat_manifest(
         raise CvatBridgeError(f"unable to parse CVAT XML: {error}") from error
     if root.tag != "annotations":
         raise CvatBridgeError("expected a CVAT annotations XML root")
-
-    for tag in root.findall("tag"):
-        if str(tag.get("label", "")) != "shot_boundary":
-            continue
-        attributes = _attribute_values(tag)
-        shot_id = str(attributes.get("shot_id", "")).strip()
-        if not shot_id:
-            raise CvatBridgeError("shot_boundary tags need shot_id")
-        start_frame = _as_int(tag.get("frame"), "shot boundary start_frame")
-        start_pts = _shape_pts(start_frame, attributes, pts_by_frame, source["frame_count"])
-        shots[shot_id] = {
-            "start_frame": start_frame,
-            "end_frame": _as_int(attributes.get("end_frame_exclusive"), "shot boundary end_frame_exclusive"),
-            "play_id": attributes.get("play_id") or None,
-            "split": attributes.get("split", "unassigned"),
-            "camera_label": attributes.get("camera_label", "unknown"),
-            "start_pts": start_pts,
-        }
-    shots = _normalized_shots(shots, source["frame_count"])
+    if root.findall("tag"):
+        raise CvatBridgeError("CVAT for video does not support root-level tags; use timing_event point tracks and review shot ranges in provenance.json")
 
     # CVAT exports track properties on each tracked shape. The source converter
     # also emits them there, so track-level attributes are accepted for hand-built
@@ -403,13 +398,12 @@ def import_cvat_manifest(
             raise CvatBridgeError("duplicate raw observation provenance entry")
         provenance_index[key] = item["raw_row"]
 
-    review = _review_fields(reviewer, reviewed_at)
     annotations: list[dict[str, Any]] = []
     landmarks: list[dict[str, Any]] = []
     timing_events: list[dict[str, Any]] = []
     for track in root.findall("track"):
         label = str(track.get("label", ""))
-        if label not in _ANNOTATION_LABELS:
+        if label not in _TRACK_LABELS:
             raise CvatBridgeError(f"unsupported CVAT track label {label!r}")
         cvat_id = str(track.get("id", "")).strip()
         if not cvat_id:
@@ -432,8 +426,36 @@ def import_cvat_manifest(
                 raise CvatBridgeError(f"CVAT annotation at source frame {frame} lies outside shot {shot_id!r}")
             if shot_id != _shot_for_frame(shots, frame):
                 raise CvatBridgeError(f"CVAT annotation at source frame {frame} has a mismatched shot_id")
+            review_status = _shape_review_status(attributes, label, frame)
+            if review_status == "rejected":
+                continue
+            review = _review_fields(reviewer, reviewed_at, review_status)
             pts = _shape_pts(frame, attributes, pts_by_frame, source["frame_count"])
             record_id = f"{shot_id}:{frame}:{track_id}"
+            if label == "timing_event":
+                if shape.tag != "points":
+                    raise CvatBridgeError(f"CVAT timing_event track {cvat_id} must use points shapes")
+                point_pairs = str(shape.get("points", "")).split(";")
+                point_values = point_pairs[0].split(",") if len(point_pairs) == 1 else []
+                if len(point_values) != 2:
+                    raise CvatBridgeError(f"timing event {record_id} must contain one point")
+                event = str(attributes.get("event", "")).strip()
+                if not event:
+                    raise CvatBridgeError(f"timing event {record_id} needs an event name")
+                timing_event: dict[str, Any] = {
+                    "id": record_id,
+                    "shot_id": shot_id,
+                    "source_frame": frame,
+                    "pts": pts,
+                    "event": event,
+                    "play_id": attributes.get("play_id") or None,
+                    "correspondence_id": attributes.get("correspondence_id") or None,
+                    **review,
+                }
+                if attributes.get("play_time_s") not in (None, ""):
+                    timing_event["play_time_s"] = _as_float(attributes["play_time_s"], "play_time_s")
+                timing_events.append(timing_event)
+                continue
             if label == "calibration_landmark":
                 point_text = str(shape.get("points", ""))
                 point_pairs = point_text.split(";")
@@ -471,6 +493,14 @@ def import_cvat_manifest(
                 raise
             source_tracklet_id = attributes.get("source_tracklet_id", "")
             raw_row = provenance_index.get((shot_id, frame, source_tracklet_id)) if source_tracklet_id else None
+            occluded = shape.get("occluded", "0") == "1"
+            visibility = attributes.get("visibility", "visible")
+            if visibility == "out_of_frame":
+                raise CvatBridgeError(f"CVAT box {record_id} is marked out_of_frame; mark the tracked shape outside instead")
+            if visibility == "occluded":
+                occluded = True
+            elif occluded and visibility == "visible":
+                visibility = "occluded"
             annotation: dict[str, Any] = {
                 "id": record_id,
                 "shot_id": shot_id,
@@ -480,12 +510,13 @@ def import_cvat_manifest(
                 "track_id": track_id,
                 "label": label,
                 "team": attributes.get("team", "unknown") or "unknown",
-                "visibility": attributes.get("visibility", "occluded" if shape.get("occluded", "0") == "1" else "visible"),
-                "occluded": shape.get("occluded", "0") == "1",
+                "visibility": visibility,
+                "occluded": occluded,
                 "jersey_readable": attributes.get("jersey_readable", "false").lower() in {"true", "1", "yes"},
                 "coordinate_space": "source",
                 "proposal_player_id": attributes.get("proposal_player_id") or None,
                 "source_tracklet_id": source_tracklet_id or None,
+                "source_shot_id": attributes.get("source_shot_id") or shot.get("source_shot_id"),
                 **review,
             }
             anonymous_id = attributes.get("anonymous_id", attributes.get("global_id", ""))
@@ -500,46 +531,6 @@ def import_cvat_manifest(
                     "raw_row": dict(raw_row),
                 }
             annotations.append(annotation)
-
-    for tag_index, tag in enumerate(root.findall("tag")):
-        label = str(tag.get("label", ""))
-        attributes = _attribute_values(tag)
-        frame = _as_int(tag.get("frame"), f"CVAT tag {label} frame")
-        if label == "shot_boundary":
-            shot_id = str(attributes.get("shot_id", "")).strip()
-            if not shot_id:
-                raise CvatBridgeError("shot_boundary tags need shot_id")
-            start = frame
-            end = _as_int(attributes.get("end_frame_exclusive"), "shot boundary end_frame_exclusive")
-            shots[shot_id] = {
-                "start_frame": start,
-                "end_frame": end,
-                "play_id": attributes.get("play_id") or None,
-                "split": attributes.get("split", "unassigned"),
-                "camera_label": attributes.get("camera_label", "unknown"),
-            }
-            continue
-        if label != "timing_event":
-            raise CvatBridgeError(f"unsupported CVAT tag label {label!r}")
-        shot_id = str(attributes.get("shot_id") or _shot_for_frame(shots, frame))
-        if shot_id not in shots or not int(shots[shot_id]["start_frame"]) <= frame < int(shots[shot_id]["end_frame"]):
-            raise CvatBridgeError(f"timing event at source frame {frame} lies outside shot {shot_id!r}")
-        event = str(attributes.get("event", "")).strip()
-        if not event:
-            raise CvatBridgeError("timing_event tags need event")
-        timing_event: dict[str, Any] = {
-            "id": f"{shot_id}:{frame}:event-{tag_index}",
-            "shot_id": shot_id,
-            "source_frame": frame,
-            "pts": _shape_pts(frame, attributes, pts_by_frame, source["frame_count"]),
-            "event": event,
-            "play_id": attributes.get("play_id") or None,
-            "correspondence_id": attributes.get("correspondence_id") or None,
-            **review,
-        }
-        if attributes.get("play_time_s") not in (None, ""):
-            timing_event["play_time_s"] = _as_float(attributes["play_time_s"], "play_time_s")
-        timing_events.append(timing_event)
 
     shots = _normalized_shots(shots, source["frame_count"])
     for collection in (annotations, landmarks, timing_events):

@@ -167,6 +167,52 @@ def _shot_id_for_frame(
     return f"shot-{_shot_index(frame_index, boundaries)}"
 
 
+def _effective_shot_segments(
+    frame_count: int,
+    boundaries: Sequence[ShotBoundary],
+    alignment: PlayAlignment | None = None,
+) -> list[dict[str, Any]]:
+    """Return non-overlapping source intervals with the shot ids used by this run."""
+
+    cuts = {0, frame_count}
+    cuts.update(boundary.frame_index for boundary in boundaries if 0 <= boundary.frame_index <= frame_count)
+    if alignment is not None:
+        for start, end in alignment.shot_ranges.values():
+            cuts.update((start, end))
+    ordered_cuts = sorted(cuts)
+    segments: list[dict[str, Any]] = []
+    for start, end in zip(ordered_cuts, ordered_cuts[1:]):
+        if start >= end:
+            continue
+        source_shot_id = _shot_id_for_frame(start, boundaries, alignment)
+        if segments and segments[-1]["source_shot_id"] == source_shot_id and segments[-1]["end_frame"] == start:
+            segments[-1]["end_frame"] = end
+        else:
+            segments.append({"source_shot_id": source_shot_id, "start_frame": start, "end_frame": end})
+
+    counts: dict[str, int] = {}
+    for segment in segments:
+        source_shot_id = segment["source_shot_id"]
+        counts[source_shot_id] = counts.get(source_shot_id, 0) + 1
+    reserved_ids = {shot_id for shot_id, count in counts.items() if count == 1}
+    for source_shot_id, count in counts.items():
+        if count == 1:
+            continue
+        index = 0
+        for segment in segments:
+            if segment["source_shot_id"] != source_shot_id:
+                continue
+            index += 1
+            candidate = f"{source_shot_id}--segment-{index}"
+            while candidate in reserved_ids:
+                candidate += "-part"
+            segment["shot_id"] = candidate
+            reserved_ids.add(candidate)
+    for segment in segments:
+        segment.setdefault("shot_id", segment["source_shot_id"])
+    return segments
+
+
 def _build_detector(args: argparse.Namespace):
     if args.detector == "synthetic":
         return SyntheticDetector()
@@ -691,7 +737,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         write_identities_json(destination / "identities.json", identity_map)
         write_metrics_json(destination / "identity-links.json", link_report)
         write_metrics_json(destination / "analysis-config.json", {"schema_version": 2, "analysis_hash": analysis_hash, "source_sha256": source_hash, "analysis": analysis_config, "detector": detector_config, "tracker": tracker_config, "evaluation_reference_sha256": reference_hash, "cache": {"path": str(cache_path), "sha256": cache_input_hash, "strict_shared": strict_shared_cache, "provenance": expected_provenance}})
-        write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges})
+        shot_segments = _effective_shot_segments(info.frame_count, boundaries, alignment)
+        for segment in shot_segments:
+            segment["play_id"] = alignment.play_id if alignment is not None and segment["source_shot_id"] in alignment.shots() else None
+        write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges, "segments": shot_segments})
         trajectories: dict[tuple[str, str], list[tuple[float, float]]] = {}
         for observation in observations:
             if observation.player_id and observation.field_xy_yards is not None:

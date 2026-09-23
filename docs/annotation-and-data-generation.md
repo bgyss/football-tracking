@@ -129,9 +129,10 @@ UV_CACHE_DIR=.uv-cache uv run python scripts/export_cvat.py \
 The output contains `annotations.xml` and `provenance.json`. The task covers the full
 source video, so a CVAT frame number is the original zero-based frame number even when
 the run processed a bounded window. Keep the sidecar with the XML; it records the source
-hash, run configuration, shot ranges, observation CSV hash, and raw inference rows.
-Exported tracks use `source="auto"`, keep their shot-local source tracklet IDs, and begin
-with `review_status=unreviewed` and `anonymous_id=unknown`.
+hash, run configuration, effective shot ranges and source IDs, observation CSV hash, and
+raw inference rows. Review shot boundaries in this sidecar. Exported tracks use
+`source="auto"`, keep their shot-local source tracklet IDs, and begin with
+`review_status=unreviewed` and `anonymous_id=unknown`.
 
 After a reviewer corrects the CVAT task, import the downloaded CVAT video XML and its
 matching sidecar:
@@ -147,10 +148,12 @@ UV_CACHE_DIR=.uv-cache uv run python scripts/import_cvat.py \
   --reviewed-at 2026-09-22T12:00:00Z
 ```
 
-The importer checks the source hash and dimensions and resolves exact PTS values from
-the original video. It writes `annotations.json` and `mot-reference.json`. Player tracks
-enter the MOT reference; officials, football, snap/play-time tags, and calibration
-landmarks remain in the reviewed manifest. `anonymous_id` becomes the reviewed
+Set every visible CVAT shape to `reviewed`, `accepted`, or `rejected`; unreviewed shapes
+stop import, and rejected proposals are omitted. The importer checks the source hash and
+dimensions and resolves exact PTS values from the original video. It writes
+`annotations.json` and `mot-reference.json`. Player tracks enter the MOT reference;
+officials, football, snap/play-time point tracks, and calibration landmarks remain in the
+reviewed manifest. `anonymous_id` becomes the reviewed
 cross-shot identity, while the model-proposed player ID remains provenance. A track that
 was added by a reviewer has no fabricated inference row.
 

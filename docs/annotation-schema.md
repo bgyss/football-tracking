@@ -86,10 +86,10 @@ has corrected it and explicitly marked it reviewed.
 ```
 
 The `shots` map uses zero-based source frames with inclusive `start_frame` and exclusive
-`end_frame`. Shot ranges cannot overlap. CVAT preannotations include a `shot_boundary`
-tag on each shot's first frame with the exclusive end frame as an attribute. Reviewers
-can correct the tag before import. Source PTS values remain separate from frame numbers
-and play time.
+`end_frame`. Shot ranges cannot overlap. CVAT video XML does not carry shot boundary tags;
+the export sidecar records the effective run shot segments and their source shot IDs.
+Reviewers can correct those ranges in `provenance.json` before import. Source PTS values
+remain separate from frame numbers and play time.
 
 ## Object labels and identity
 
@@ -111,15 +111,18 @@ and `LAR`) plus `unknown`. `visibility` is one of `visible`, `partially_visible`
 CVAT/MOT consumers that need the distinction. `jersey_readable` is a boolean. CVAT uses
 `review_status` values `unreviewed`, `reviewed`, `accepted`, and `rejected`. Imported
 records receive reviewed metadata only when the importer is explicitly invoked with
-`--reviewed`, `--reviewer`, and `--reviewed-at`.
+`--reviewed`, `--reviewer`, and `--reviewed-at`. Each visible CVAT shape must be marked
+`reviewed`, `accepted`, or `rejected`; an `unreviewed` or missing status stops import, and
+rejected shapes are omitted from the manifest and MOT reference. CVAT `outside` shapes
+are omitted because they have no visible box to score.
 
 ## Timing anchors and calibration landmarks
 
 `timing_events` record snap and corresponding action events with the original
 `source_frame` and `pts`, a `play_id`, and optionally a `correspondence_id` shared across
 replay views. `play_time_s` is a reviewed play-relative time; it never replaces or
-rewrites the media PTS. The CVAT tag label is `timing_event` and carries `event`,
-`play_id`, `correspondence_id`, `play_time_s`, and `source_pts` attributes.
+rewrites the media PTS. In CVAT video XML, timing events are `timing_event` point tracks
+with `event`, `play_id`, `correspondence_id`, `play_time_s`, and `source_pts` attributes.
 
 Landmarks use `image_xy_px`, `field_xy_yards`, `source_frame`, and `pts`; `role` is `fit`
 or `withheld`. Each keyframe needs at least four fit landmarks and one independent
@@ -146,11 +149,14 @@ each proposal carries `source_pts`, `detection_score`, team evidence, `source_ru
 `source_tracklet_id`, and `proposal_player_id`. `anonymous_id` starts as `unknown` and
 `review_status` starts as `unreviewed`. The sidecar records the source hash, run and
 tracker configuration, shot ranges, the observations CSV hash, and the original rows for
-each proposal. Keep the sidecar with the XML through review. See the [CVAT video XML
+each proposal, including the source shot ID when a reviewed alignment assigned another
+effective shot name. CVAT video XML stores snap/play-time anchors as point tracks; shot
+boundaries stay in the sidecar. Keep the sidecar with the XML through review. See the [CVAT video XML
 format](https://docs.cvat.ai/docs/manual/advanced/formats/format-cvat/).
 
 [`scripts/import_cvat.py`](../scripts/import_cvat.py) checks that the source video hash
-and dimensions match the sidecar, preserves frame numbers and exact PTS, and writes both
+and dimensions match the sidecar, resolves each PTS from the verified source frame index,
+preserves frame numbers, and writes both
 `annotations.json` and `mot-reference.json`. A box's original inference row is retained
 under `inference_provenance` when its shot, frame, and source tracklet still match. New
 human-added boxes have no fabricated inference provenance. Only reviewed `player`
