@@ -42,6 +42,7 @@ class AnnotationManifest:
     annotations: tuple[dict[str, Any], ...]
     landmarks: tuple[dict[str, Any], ...] = ()
     frame_labels: tuple[dict[str, Any], ...] = ()
+    timing_events: tuple[dict[str, Any], ...] = ()
 
 
 def _validate_review_metadata(raw: Mapping[str, Any], label: str) -> None:
@@ -173,6 +174,15 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
             raise AnnotationError(f"annotation {annotation_id} must be converted to source coordinates before review")
         if require_reviewed and raw.get("review_status") not in {"reviewed", "accepted"}:
             raise AnnotationError(f"annotation {annotation_id} is not reviewed")
+        label = str(raw.get("label", "player"))
+        if label not in {"player", "official", "football"}:
+            raise AnnotationError(f"annotation {annotation_id} has unsupported label {label!r}")
+        visibility = raw.get("visibility")
+        if visibility is not None and visibility not in {"visible", "partially_visible", "occluded", "out_of_frame", "unknown"}:
+            raise AnnotationError(f"annotation {annotation_id} has unsupported visibility {visibility!r}")
+        team = raw.get("team")
+        if team is not None and not str(team).strip():
+            raise AnnotationError(f"annotation {annotation_id} has an empty team")
         if require_reviewed:
             _validate_review_metadata(raw, f"annotation {annotation_id}")
         annotations.append(dict(raw))
@@ -255,7 +265,49 @@ def load_annotation_manifest(path: str | Path, source_sha256: str, *, require_re
         if require_reviewed:
             _validate_review_metadata(raw, f"frame label {shot_id}:{frame_index}")
         frame_labels.append(dict(raw))
-    return AnnotationManifest(1, reviewed, source_sha256, width, height, frame_count, (numerator, denominator), shots, tuple(annotations), tuple(landmarks), tuple(frame_labels))
+    raw_timing_events = value.get("timing_events", [])
+    if not isinstance(raw_timing_events, list):
+        raise AnnotationError("timing_events must be a list")
+    seen_timing_events: set[str] = set()
+    timing_events: list[dict[str, Any]] = []
+    for raw in raw_timing_events:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            raise AnnotationError("each timing event needs a unique id")
+        event_id = str(raw["id"])
+        if event_id in seen_timing_events:
+            raise AnnotationError(f"duplicate timing event id {event_id}")
+        seen_timing_events.add(event_id)
+        shot_id = str(raw.get("shot_id", ""))
+        shot = shots.get(shot_id)
+        if shot is None:
+            raise AnnotationError(f"timing event {event_id} names an unknown shot")
+        try:
+            frame_index = int(raw["source_frame"])
+            pts = int(raw["pts"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise AnnotationError(f"timing event {event_id} needs source_frame and pts") from error
+        if not shot.contains(frame_index) or pts < 0:
+            raise AnnotationError(f"timing event {event_id} lies outside its shot or has invalid pts")
+        if not str(raw.get("event", "")).strip():
+            raise AnnotationError(f"timing event {event_id} needs an event name")
+        play_time = raw.get("play_time_s")
+        if play_time is not None:
+            try:
+                play_time = float(play_time)
+            except (TypeError, ValueError) as error:
+                raise AnnotationError(f"timing event {event_id} has invalid play_time_s") from error
+            if not math.isfinite(play_time):
+                raise AnnotationError(f"timing event {event_id} has invalid play_time_s")
+        if require_reviewed:
+            if raw.get("review_status") not in {"reviewed", "accepted"}:
+                raise AnnotationError(f"timing event {event_id} is not reviewed")
+            _validate_review_metadata(raw, f"timing event {event_id}")
+        timing_events.append(dict(raw))
+    return AnnotationManifest(
+        1, reviewed, source_sha256, width, height, frame_count,
+        (numerator, denominator), shots, tuple(annotations), tuple(landmarks),
+        tuple(frame_labels), tuple(timing_events),
+    )
 
 
 def source_bbox_from_crop(
@@ -303,7 +355,7 @@ def manifest_template_from_review_pack(pack: Mapping[str, Any], shots: Mapping[s
     for previous, current in zip(ordered, ordered[1:]):
         if current[1]["start_frame"] < previous[1]["end_frame"]:
             raise AnnotationError(f"shot template ranges overlap: {previous[0]} and {current[0]}")
-    return {"schema_version": 1, "reviewed": False, "source": dict(source), "shots": normalized_shots, "annotations": [], "landmarks": [], "frame_labels": [], "review_frames": list(pack.get("frames", [])), "review_policy": "Fill and review all labels, then set reviewed=true."}
+    return {"schema_version": 1, "reviewed": False, "source": dict(source), "shots": normalized_shots, "annotations": [], "landmarks": [], "timing_events": [], "frame_labels": [], "review_frames": list(pack.get("frames", [])), "review_policy": "Fill and review all labels, then set reviewed=true."}
 
 
 def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
@@ -327,6 +379,8 @@ def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
     frame_pts: dict[tuple[str, int], int] = {}
     seen_objects: set[tuple[str, int, str]] = set()
     for raw in manifest.annotations:
+        if str(raw.get("label", "player")) != "player":
+            continue
         shot_id = str(raw["shot_id"])
         frame_index = int(raw["source_frame"])
         pts = int(raw["pts"])
@@ -346,6 +400,10 @@ def mot_reference_from_manifest(manifest: AnnotationManifest) -> dict[str, Any]:
         object_value: dict[str, Any] = {"id": object_id, "bbox_xyxy": list(_box(raw["bbox_xyxy_px"]))}
         if raw.get("team") is not None:
             object_value["team"] = str(raw["team"])
+        if raw.get("visibility") is not None:
+            object_value["visibility"] = str(raw["visibility"])
+        if raw.get("occluded") is not None:
+            object_value["occluded"] = bool(raw["occluded"])
         contact = raw.get("ground_contact_xy_yards")
         if contact is not None:
             try:

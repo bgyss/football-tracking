@@ -74,7 +74,9 @@ export → evaluate → manifest.
 - `calibration_timeline.py` — reviewed PTS-scoped fits, withheld-landmark eligibility, and
   bounded field-only motion propagation proposals.
 - `annotations.py` / `field.py` — source-hashed reviewed annotation manifests and the
-  canonical NFL field coordinate template.
+  canonical NFL field coordinate template. `cvat.py` and its export/import scripts bridge
+  full-source-frame CVAT video tracks, preserve inference provenance, and limit MOT
+  references to reviewed player boxes.
 - `scripts/fit_calibration_timeline.py` — convert a reviewed annotation manifest into the
   schema-v2 PTS-scoped calibration artifact.
 - `scripts/build_annotation_manifest.py` — create an unreviewed manifest template from the
@@ -85,6 +87,8 @@ export → evaluate → manifest.
   reviewed-reference prerequisites before attempting promotion.
 - `scripts/build_play_inventory.py` — scan long recordings into unreviewed candidate shot
   intervals for play grouping and calibration review.
+- `scripts/export_cvat.py` / `scripts/import_cvat.py` — export observations as CVAT video
+  preannotations and import explicitly reviewed tracks, timing events, and landmarks.
 - `evaluation.py` — reviewed MOT-style reference import and HOTA/IDF1-style metrics.
   Without `--reviewed-reference`, `tracking-evaluation.json` says `not_evaluated`.
 - `memory.py` — `MemoryBudget`, a peak-RSS guard (default 2048 MiB) sampled at stage

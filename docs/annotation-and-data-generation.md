@@ -64,7 +64,7 @@ UV_CACHE_DIR=.uv-cache uv run python -m football_tracking run \
   --manual-cut 712
 ```
 
-The run produces `detections.jsonl`, `observations.csv`, `observations.parquet`, `trajectories.csv`, and `annotated.mp4`. The future CVAT adapter should read `observations.csv` and create one `source="auto"` CVAT track per `tracklet_id`. Use `tracklet_id` as the proposal identity because the current `player_id` is deterministic per tracklet and cross-view replay identity is intentionally unresolved.
+The run produces `detections.jsonl`, `observations.csv`, `observations.parquet`, `trajectories.csv`, and `annotated.mp4`. Use `scripts/export_cvat.py` to create one `source="auto"` CVAT track per shot-local `tracklet_id`. The tracklet and model-proposed `player_id` remain provenance fields; they are not a reviewed cross-shot identity.
 
 The converter should preserve original frame numbers and boxes, attach the detector score as an attribute, and mark a box as a keyframe when a track starts, ends, changes sharply, or crosses an occlusion boundary. It should never silently discard detector candidates or rewrite the raw cache.
 
@@ -117,12 +117,51 @@ and detector proposals. Its output is an unreviewed proposal pack; it cannot be 
 the evaluation loader until a human has filled the shot, split, landmark, contact, and
 identity fields and marked the manifest reviewed.
 
-The current code already has a clean seam for an annotation adapter. The next small additions should be:
+Export run observations as CVAT video preannotations with:
 
-- `src/football_tracking/cvat.py`: serialize and parse reviewed CVAT tracks;
-- `scripts/export_cvat.py`: convert a run's `observations.csv` into CVAT preannotations;
-- `scripts/import_cvat.py`: convert corrected tracks into COCO/YOLO and MOT-style ground truth;
-- `docs/annotation-schema.md`: freeze labels, attributes, visibility rules, and split policy;
-- an active-learning report that emits the frame list above from detector and tracker uncertainty.
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/export_cvat.py \
+  --run-dir artifacts/game-001 \
+  --source data/game-001.mp4 \
+  --output-dir artifacts/game-001/cvat
+```
 
-Until those adapters exist, do not hand-edit `observations.csv` as a substitute for an annotation record. Keep reviewed corrections in a versioned overlay so raw inference can be reproduced and compared.
+The output contains `annotations.xml` and `provenance.json`. The task covers the full
+source video, so a CVAT frame number is the original zero-based frame number even when
+the run processed a bounded window. Keep the sidecar with the XML; it records the source
+hash, run configuration, shot ranges, observation CSV hash, and raw inference rows.
+Exported tracks use `source="auto"`, keep their shot-local source tracklet IDs, and begin
+with `review_status=unreviewed` and `anonymous_id=unknown`.
+
+After a reviewer corrects the CVAT task, import the downloaded CVAT video XML and its
+matching sidecar:
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/import_cvat.py \
+  --annotations artifacts/game-001/cvat/annotations.xml \
+  --provenance artifacts/game-001/cvat/provenance.json \
+  --source data/game-001.mp4 \
+  --output-dir artifacts/game-001/reviewed \
+  --reviewed \
+  --reviewer reviewer-1 \
+  --reviewed-at 2026-09-22T12:00:00Z
+```
+
+The importer checks the source hash and dimensions and resolves exact PTS values from
+the original video. It writes `annotations.json` and `mot-reference.json`. Player tracks
+enter the MOT reference; officials, football, snap/play-time tags, and calibration
+landmarks remain in the reviewed manifest. `anonymous_id` becomes the reviewed
+cross-shot identity, while the model-proposed player ID remains provenance. A track that
+was added by a reviewer has no fabricated inference row.
+
+The bridge does not run CVAT or mark inference output reviewed by itself. The import
+command requires an explicit `--reviewed` assertion and reviewer metadata. Continue to
+report an evaluation as `not_evaluated` until a human has reviewed the output and the
+other evaluation prerequisites are available.
+
+An active-learning report that emits the frame list above from detector and tracker
+uncertainty remains a future addition.
+
+Do not hand-edit `observations.csv` as a substitute for an annotation record. Keep
+reviewed corrections in the versioned manifest so raw inference can be reproduced and
+compared.
