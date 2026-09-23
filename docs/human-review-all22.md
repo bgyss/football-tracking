@@ -49,8 +49,10 @@ such as `yardline:20:hash:near` or
 
 The canonical field coordinate system is fixed: `x=0` is the west end line,
 `x=120` is the east end line, and `y=0` is the near sideline. Do not flip the
-orientation to make a fit look better. Hough line segments in the pack are hints;
-replace them with human-reviewed point landmarks.
+orientation to make a fit look better. Hough line and intersection proposals in
+the pack are hints. `scripts/export_cvat.py --review-pack ...` can load the
+intersections as point tracks; assign a semantic `landmark_id` and role before
+importing them into the calibration manifest.
 
 Add a new keyframe after a pan, zoom, or other camera move changes the
 projection. A propagated calibration may only cover the declared supported PTS
@@ -83,13 +85,25 @@ Never align two shots by wall-clock position in the file when the footage contai
 replay freezes, edits, or slow motion. The evaluator refuses to extrapolate
 outside the reviewed correspondence support.
 
+For a bounded candidate window, `scripts/propose_timing_events.py` can emit
+source-frame/PTS motion-burst proposals. It does not classify a burst as `snap`
+or `ball_release`; review the window and assign the shared event names manually.
+
 ## 4. Review players and within-shot tracks
 
 Use a local video annotation tool such as CVAT Community for the contiguous
-window. Keep the source frame offset if a clip is extracted. The repository does
-not currently include a CVAT importer/exporter, so preserve the reviewed labels
-and transcribe/export them into the repository manifest rather than editing the
-raw `observations.csv` cache.
+window. The repository's `scripts/export_cvat.py` writes proposal tracks plus a
+source-hashed `task-frame-map.json` containing the source frame, integer source
+PTS, time base, and any crop transform. `scripts/import_cvat.py` verifies that
+map against the original video and converts corrected boxes back into source
+coordinates. Keep the raw `observations.csv` cache immutable.
+
+The CVAT export can also include `ground_contact` point proposals and
+`field_landmark` intersection proposals. Correct contact points in original
+source coordinates, set `ground_contact_confidence`, and assign each field point
+its semantic ID and `fit` or `withheld` role. The importer stores unresolved
+point proposals separately and keeps the manifest unreviewed until they are
+resolved.
 
 For every inspected frame:
 
@@ -130,6 +144,14 @@ Have a second reviewer inspect every accepted cross-shot link and every rejected
 or ambiguous link. Record the reviewer, revision, timestamp, and confidence for
 each reviewed object, landmark, and frame label.
 
+Use `scripts/build_identity_review_queue.py` to order accepted links, close
+alternatives, rejected edges, and unmatched tracklets for manual inspection. Its
+optional contact sheet is only a navigation aid; the review item includes the
+original source frame and PTS for each sample. `scripts/propose_jersey_reads.py`
+can produce unreviewed OCR candidates for sufficiently large crops. The run
+resolver only uses explicitly reviewed reliable number conflicts as a hard
+constraint; automatic OCR or appearance cues only change review ordering.
+
 ## 6. Build and validate the repository artifacts
 
 Create an unreviewed manifest skeleton after the shot table is confirmed:
@@ -141,11 +163,12 @@ UV_CACHE_DIR=.uv-cache uv run python scripts/build_annotation_manifest.py \
   --shot shot-0:START_FRAME:END_FRAME:sideline:play-0042:development
 ```
 
-Fill the template with the reviewed boxes, landmarks, frame labels, contacts,
-teams, track IDs, and global IDs. Every reviewed record needs source coordinates,
-source frame and PTS, `review_status`, `reviewer`, positive `revision`, an ISO-8601
-`reviewed_at`, and `annotation_confidence`. Set the manifest's `reviewed` flag to
-`true` only after the whole declared batch has been checked.
+Import corrected CVAT tracks into the template with `scripts/import_cvat.py`.
+The default import remains unreviewed. To promote a completed, checked batch,
+pass `--mark-reviewed`, `--reviewer`, `--revision`, `--reviewed-at`, and
+`--annotation-confidence`; the importer validates those fields and the source
+mapping before writing the manifest. Field semantics, ground-contact confidence,
+play links, and global identity still require explicit human review.
 
 Then create the derived artifacts:
 
@@ -158,6 +181,7 @@ UV_CACHE_DIR=.uv-cache uv run python scripts/fit_calibration_timeline.py \
 UV_CACHE_DIR=.uv-cache uv run python scripts/build_reviewed_reference.py \
   --annotations /path/to/reviewed-manifest.json \
   --source data/all-22-lions-rams.mp4 \
+  --calibration artifacts/calibration-timeline.json \
   --output artifacts/reviewed-reference.json
 
 UV_CACHE_DIR=.uv-cache uv run python scripts/check_identity_readiness.py \
@@ -173,4 +197,3 @@ useful diagnosis: it identifies which source-hashed calibration, timing, or
 reviewed-reference gate is still missing. Do not report identity accuracy until
 the real footage has passed this readiness check and the held-out evaluation
 windows have been sealed.
-

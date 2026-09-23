@@ -84,8 +84,8 @@ def test_manifest_template_preserves_review_pack_source_and_frame_records() -> N
 def test_reviewed_manifest_converts_to_mot_reference_and_cross_shot_map(tmp_path) -> None:
     value = manifest(
         annotations=[
-            {**manifest()["annotations"][0], "track_id": "p1", "global_id": "PLAYER-A", "team": "DET", "ground_contact_xy_yards": [20, 2]},
-            {**manifest()["annotations"][0], "id": "b", "track_id": "q1", "shot_id": "shot-0", "source_frame": 3, "pts": 180, "global_id": "PLAYER-A", "bbox_xyxy_px": [20, 2, 30, 20], "team": "DET"},
+            {**manifest()["annotations"][0], "track_id": "p1", "global_id": "PLAYER-A", "cross_shot_review_status": "approved", "identity_second_reviewer": "reviewer-2", "identity_second_reviewed_at": "2026-09-15T00:10:00Z", "identity_second_revision": 1, "identity_second_confidence": 1.0, "team": "DET", "ground_contact_xy_yards": [20, 2]},
+            {**manifest()["annotations"][0], "id": "b", "track_id": "q1", "shot_id": "shot-0", "source_frame": 3, "pts": 180, "global_id": "PLAYER-A", "cross_shot_review_status": "approved", "identity_second_reviewer": "reviewer-2", "identity_second_reviewed_at": "2026-09-15T00:10:00Z", "identity_second_revision": 1, "identity_second_confidence": 1.0, "bbox_xyxy_px": [20, 2, 30, 20], "team": "DET"},
         ],
     )
     parsed = load_annotation_manifest(write(tmp_path, value), "abc")

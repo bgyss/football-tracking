@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export observations from one run directory as CVAT video preannotations."""
+"""Export source-addressed observation proposals to a CVAT video XML bundle."""
 
 from __future__ import annotations
 
@@ -7,127 +7,226 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from typing import Sequence
 
-from football_tracking.cvat import CvatBridgeError, build_cvat_preannotations
-from football_tracking.metrics import sha256_file
-from football_tracking.video import VideoInfo, frame_pts
+from football_tracking.cvat import CvatBox, CvatError, CvatPoint, CvatTrack, build_task_frame_map, source_bbox_to_task, source_point_to_task, write_cvat_bundle, write_cvat_video_xml
 
 
-def _read_json(path: Path) -> dict:
+def _parse_crop(value: str | None) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise CvatBridgeError(f"unable to read {path.name}: {error}") from error
-    if not isinstance(value, dict):
-        raise CvatBridgeError(f"{path.name} must contain a JSON object")
-    return value
+        values = tuple(float(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("crop must be x1,y1,x2,y2") from error
+    if len(values) != 4:
+        raise argparse.ArgumentTypeError("crop must be x1,y1,x2,y2")
+    return values  # type: ignore[return-value]
 
 
-def _shot_metadata(value: dict, frame_count: int, play_id: str | None, pts_by_frame: Sequence[int]) -> dict[str, dict[str, object]]:
-    segments = value.get("segments")
-    if isinstance(segments, list) and segments:
-        result: dict[str, dict[str, object]] = {}
-        for index, raw in enumerate(segments):
-            if not isinstance(raw, dict):
-                raise CvatBridgeError(f"shots.json segment {index} must be an object")
-            shot_id = str(raw.get("shot_id", "")).strip()
-            source_shot_id = str(raw.get("source_shot_id", shot_id)).strip()
+def _parse_size(value: str | None) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    try:
+        width, height = (int(item) for item in value.lower().split("x", 1))
+    except (ValueError, TypeError) as error:
+        raise argparse.ArgumentTypeError("task size must be WIDTHxHEIGHT") from error
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("task size dimensions must be positive")
+    return (width, height)
+
+
+def export_observations(
+    observations_path: Path,
+    source_path: Path,
+    *,
+    shot_id: str,
+    start_frame: int,
+    end_frame: int,
+    output_path: Path,
+    cvat_xml_output: Path | None = None,
+    crop_xyxy_px: tuple[float, float, float, float] | None = None,
+    task_size: tuple[int, int] | None = None,
+    review_pack_path: Path | None = None,
+    frame_map_output: Path | None = None,
+    max_gap_frames: int = 2,
+    task_name: str = "football-tracking-proposals",
+) -> None:
+    if not shot_id:
+        raise CvatError("shot_id must be non-empty")
+    if not isinstance(max_gap_frames, int) or isinstance(max_gap_frames, bool) or max_gap_frames < 0:
+        raise CvatError("max_gap_frames must be a non-negative integer")
+    frame_map = build_task_frame_map(source_path, start_frame=start_frame, end_frame=end_frame, crop_xyxy_px=crop_xyxy_px, task_size=task_size)
+    task_by_source = frame_map.by_source_frame()
+    grouped: dict[str, list[tuple[int, dict[str, str]]]] = {}
+    with observations_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("shot_id", "")) != shot_id:
+                continue
             try:
-                start, end = int(raw["start_frame"]), int(raw["end_frame"])
-            except (KeyError, TypeError, ValueError) as error:
-                raise CvatBridgeError(f"shots.json segment {index} needs start_frame/end_frame") from error
-            if not shot_id or not source_shot_id or start < 0 or end <= start or end > frame_count:
-                raise CvatBridgeError(f"shots.json segment {index} has invalid source-frame metadata")
-            if shot_id in result:
-                raise CvatBridgeError(f"shots.json contains duplicate effective shot id {shot_id!r}")
-            result[shot_id] = {
-                "source_shot_id": source_shot_id,
-                "start_frame": start,
-                "end_frame": end,
-                "play_id": raw.get("play_id", play_id),
-                "split": "unassigned",
-                "camera_label": "unknown",
-                "start_pts": pts_by_frame[start] if start < len(pts_by_frame) else None,
-            }
-        return result
+                source_frame = int(row["frame_index"])
+                row_pts = int(row["pts"])
+                bbox = tuple(float(item) for item in json.loads(row["bbox_xyxy_px"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise CvatError(f"invalid observation row for shot {shot_id}") from error
+            if source_frame not in task_by_source:
+                continue
+            mapped = task_by_source[source_frame]
+            if row_pts != mapped.source_pts:
+                raise CvatError(f"observation PTS mismatch at source frame {source_frame}: {row_pts} != {mapped.source_pts}")
+            tracklet_id = str(row.get("tracklet_id", "")).strip()
+            if not tracklet_id:
+                raise CvatError(f"observation at source frame {source_frame} has no tracklet_id")
+            if len(bbox) != 4:
+                raise CvatError(f"observation at source frame {source_frame} has invalid box")
+            grouped.setdefault(tracklet_id, []).append((source_frame, row))
 
-    ranges = value.get("ranges")
-    if not isinstance(ranges, list) or not ranges:
-        raise CvatBridgeError("shots.json must contain non-empty source-frame ranges")
-    raw_boundaries = value.get("boundaries", [])
-    boundaries = {
-        int(item["frame_index"]): int(item["pts"])
-        for item in raw_boundaries
-        if isinstance(item, dict) and "frame_index" in item and "pts" in item
-    } if isinstance(raw_boundaries, list) else {}
-    result: dict[str, dict[str, object]] = {}
-    for index, interval in enumerate(ranges):
-        if not isinstance(interval, list) or len(interval) != 2:
-            raise CvatBridgeError(f"shots.json range {index} must be [start_frame, end_frame]")
+    tracks: list[CvatTrack] = []
+    cvat_track_number = 0
+    for tracklet_id, values in sorted(grouped.items()):
+        values.sort(key=lambda item: item[0])
+        run_ids = {str(row.get("run_id", "")).strip() for _, row in values}
+        if len(run_ids) != 1 or not next(iter(run_ids)):
+            raise CvatError(f"observations for {tracklet_id} must come from one run with a run_id")
+        run_id = next(iter(run_ids))
+        segments: list[list[tuple[int, dict[str, str]]]] = []
+        for frame, row in values:
+            if not segments or frame - segments[-1][-1][0] > max_gap_frames + 1:
+                segments.append([])
+            segments[-1].append((frame, row))
+        for segment_index, segment in enumerate(segments):
+            boxes: list[CvatBox] = []
+            for source_frame, row in segment:
+                mapped = task_by_source[source_frame]
+                try:
+                    original_box = tuple(float(item) for item in json.loads(row["bbox_xyxy_px"]))
+                except (TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise CvatError(f"invalid bbox for {tracklet_id} at {source_frame}") from error
+                cx1, cy1, cx2, cy2 = mapped.crop_xyxy_px
+                clipped = (max(original_box[0], cx1), max(original_box[1], cy1), min(original_box[2], cx2), min(original_box[3], cy2))
+                if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
+                    continue
+                coordinates = source_bbox_to_task(clipped, mapped)
+                attrs = {
+                    "source_frame": source_frame,
+                    "source_pts": mapped.source_pts,
+                    "detection_score": row.get("detection_score", ""),
+                    "team_suggestion": row.get("team", "unknown"),
+                    "team_score": row.get("team_score", "0"),
+                    "source_inference_row_json": json.dumps(row, sort_keys=True, separators=(",", ":")),
+                    "ground_contact_proposal_xy_px": json.dumps([round((clipped[0] + clipped[2]) / 2.0, 3), round(clipped[3], 3)], separators=(",", ":")),
+                    "review_status": "unreviewed",
+                }
+                boxes.append(CvatBox(mapped.task_frame, coordinates, keyframe=True, attributes=attrs))
+            if not boxes:
+                continue
+            tracks.append(CvatTrack(
+                cvat_track_number,
+                "player",
+                "auto",
+                {
+                    "tracklet_id": tracklet_id,
+                    "proposal_segment": segment_index,
+                    "source_run_id": run_id,
+                    "source_shot_id": shot_id,
+                    "source_sha256": frame_map.source_sha256,
+                    "review_status": "unreviewed",
+                },
+                tuple(boxes),
+            ))
+            cvat_track_number += 1
+            contact_shapes: list[CvatPoint] = []
+            for source_frame, row in segment:
+                mapped = task_by_source[source_frame]
+                original_box = tuple(float(item) for item in json.loads(row["bbox_xyxy_px"]))
+                contact = ((original_box[0] + original_box[2]) / 2.0, original_box[3])
+                try:
+                    contact_task_xy = source_point_to_task(contact, mapped)
+                except CvatError:
+                    continue
+                contact_shapes.append(CvatPoint(mapped.task_frame, (contact_task_xy,), attributes={"source_frame": str(source_frame), "source_pts": str(mapped.source_pts), "method": "bbox_bottom_center", "review_status": "unreviewed"}))
+            if contact_shapes:
+                tracks.append(CvatTrack(
+                    cvat_track_number,
+                    "ground_contact",
+                    "auto",
+                    {"tracklet_id": tracklet_id, "proposal_method": "bbox_bottom_center", "source_sha256": frame_map.source_sha256, "review_status": "unreviewed"},
+                    (),
+                    tuple(contact_shapes),
+                ))
+                cvat_track_number += 1
+    if review_pack_path is not None:
         try:
-            start, end = int(interval[0]), int(interval[1])
-        except (TypeError, ValueError) as error:
-            raise CvatBridgeError(f"shots.json range {index} must contain integers") from error
-        if start < 0 or end <= start or end > frame_count:
-            raise CvatBridgeError(f"shots.json range {index} lies outside the source")
-        result[f"shot-{index}"] = {
-            "start_frame": start,
-            "end_frame": end,
-            "play_id": play_id,
-            "split": "unassigned",
-            "camera_label": "unknown",
-            "start_pts": pts_by_frame[start] if start < len(pts_by_frame) else boundaries.get(start),
-        }
-    return result
+            review_pack = json.loads(review_pack_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise CvatError(f"unable to read field proposal pack: {error}") from error
+        if not isinstance(review_pack, dict) or review_pack.get("source", {}).get("sha256") != frame_map.source_sha256:
+            raise CvatError("field proposal pack source sha256 does not match input video")
+        mapped_frames = frame_map.by_source_frame()
+        for record in review_pack.get("frames", []):
+            if not isinstance(record, dict):
+                continue
+            source_frame = int(record.get("source_frame", -1))
+            if source_frame not in mapped_frames:
+                continue
+            mapped = mapped_frames[source_frame]
+            if int(record.get("pts", -1)) != mapped.source_pts:
+                raise CvatError(f"field proposal PTS mismatch at source frame {source_frame}")
+            for proposal_index, proposal in enumerate(record.get("field_intersection_proposals", [])):
+                if not isinstance(proposal, dict) or not isinstance(proposal.get("point_xy_px"), list):
+                    continue
+                point_task_xy = source_point_to_task(proposal["point_xy_px"], mapped)
+                tracks.append(CvatTrack(
+                    cvat_track_number,
+                    "field_landmark",
+                    "auto",
+                    {"proposal_id": f"{source_frame}:{proposal_index}", "landmark_id": "", "role": "", "source_sha256": frame_map.source_sha256, "review_status": "unreviewed"},
+                    (),
+                    (CvatPoint(mapped.task_frame, (point_task_xy,), attributes={"source_frame": str(source_frame), "source_pts": str(mapped.source_pts), "support_score": str(proposal.get("support_score", "")), "review_status": "unreviewed"}),),
+                ))
+                cvat_track_number += 1
+    xml_bytes = write_cvat_video_xml(
+        tracks,
+        frame_map,
+        task_name=task_name,
+        label_attributes={
+            "player": ("team", "global_id", "jersey_number", "visibility", "review_status", "ground_contact_xy_yards", "ground_contact_confidence", "cross_shot_review_status", "identity_second_reviewer", "identity_second_reviewed_at", "identity_second_revision", "identity_second_confidence", "source_run_id", "source_shot_id", "source_inference_row_json"),
+            "official": ("team", "visibility", "review_status"),
+            "football": ("visibility", "review_status"),
+            "ground_contact": ("tracklet_id", "proposal_method", "source_sha256", "review_status", "ground_contact_confidence"),
+            "field_landmark": ("proposal_id", "landmark_id", "role", "source_sha256", "review_status", "field_x_yards", "field_y_yards"),
+            "timing_event": ("event", "play_id", "correspondence_id", "play_time_s", "source_frame", "source_pts", "review_status"),
+        },
+        point_labels=("field_landmark", "ground_contact", "timing_event"),
+    )
+    write_cvat_bundle(output_path, xml_bytes, frame_map)
+    cvat_xml_path = cvat_xml_output or output_path.with_suffix(".xml")
+    cvat_xml_path.parent.mkdir(parents=True, exist_ok=True)
+    cvat_xml_path.write_bytes(xml_bytes)
+    if frame_map_output is not None:
+        frame_map_output.parent.mkdir(parents=True, exist_ok=True)
+        frame_map_output.write_text(json.dumps(frame_map.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-dir", type=Path, required=True, help="directory containing observations.csv and run artifacts")
-    parser.add_argument("--source", type=Path, required=True, help="original source video used by the run")
-    parser.add_argument("--output-dir", type=Path, required=True, help="directory for annotations.xml and provenance.json")
-    args = parser.parse_args(argv)
-
+    parser.add_argument("--observations", type=Path, required=True, help="run observations.csv")
+    parser.add_argument("--source", type=Path, required=True, help="original source video")
+    parser.add_argument("--shot-id", required=True)
+    parser.add_argument("--start-frame", type=int, required=True, help="inclusive source frame")
+    parser.add_argument("--end-frame", type=int, required=True, help="exclusive source frame")
+    parser.add_argument("--output", type=Path, required=True, help="CVAT bundle .zip")
+    parser.add_argument("--cvat-xml-output", type=Path, help="standalone annotations.xml for import into an existing CVAT task; defaults beside the bundle")
+    parser.add_argument("--crop", type=_parse_crop, help="source-space crop x1,y1,x2,y2 for a matching cropped CVAT task")
+    parser.add_argument("--task-size", type=_parse_size, help="cropped task frame dimensions WIDTHxHEIGHT")
+    parser.add_argument("--review-pack", type=Path, help="optional review-pack.json with unreviewed field-intersection proposals")
+    parser.add_argument("--frame-map-output", type=Path, help="also write the source mapping as a standalone JSON sidecar for the later CVAT export")
+    parser.add_argument("--max-gap-frames", type=int, default=2, help="split exported tracks after this many missing source frames")
+    parser.add_argument("--task-name", default="football-tracking-proposals")
+    args = parser.parse_args()
     try:
-        run_dir = args.run_dir
-        observations_path = run_dir / "observations.csv"
-        run = _read_json(run_dir / "run-manifest.json")
-        shots_value = _read_json(run_dir / "shots.json")
-        config_path = run_dir / "analysis-config.json"
-        config = _read_json(config_path) if config_path.exists() else {}
-        source_hash = sha256_file(args.source)
-        info = VideoInfo.from_path(args.source)
-        pts_values = frame_pts(args.source)
-        if str(run.get("input_sha256", "")) != source_hash:
-            raise CvatBridgeError("run manifest input_sha256 does not match --source")
-        if int(run.get("frame_count", -1)) != info.frame_count:
-            raise CvatBridgeError("run manifest frame_count does not match --source")
-        analysis = config.get("analysis", {}) if isinstance(config.get("analysis", {}), dict) else {}
-        play_id_value = analysis.get("play_id")
-        shots = _shot_metadata(shots_value, info.frame_count, None if play_id_value is None else str(play_id_value), pts_values)
-        source = {
-            "sha256": source_hash,
-            "width": info.width,
-            "height": info.height,
-            "frame_count": info.frame_count,
-            "time_base": list(info.time_base),
-        }
-        with observations_path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
-        xml_text, provenance = build_cvat_preannotations(
-            rows,
-            source=source,
-            run=run,
-            shots=shots,
-            observations_csv_sha256=sha256_file(observations_path),
-            pts_by_frame=pts_values,
-        )
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        (args.output_dir / "annotations.xml").write_text(xml_text + "\n", encoding="utf-8")
-        (args.output_dir / "provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    except (OSError, CvatBridgeError, RuntimeError, TypeError, ValueError) as error:
-        parser.error(str(error))
+        export_observations(args.observations, args.source, shot_id=args.shot_id, start_frame=args.start_frame, end_frame=args.end_frame, output_path=args.output, cvat_xml_output=args.cvat_xml_output, crop_xyxy_px=args.crop, task_size=args.task_size, review_pack_path=args.review_pack, frame_map_output=args.frame_map_output, max_gap_frames=args.max_gap_frames, task_name=args.task_name)
+    except (CvatError, OSError) as error:
+        raise SystemExit(str(error)) from error
     return 0
 
 

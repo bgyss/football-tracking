@@ -74,9 +74,14 @@ export → evaluate → manifest.
 - `calibration_timeline.py` — reviewed PTS-scoped fits, withheld-landmark eligibility, and
   bounded field-only motion propagation proposals.
 - `annotations.py` / `field.py` — source-hashed reviewed annotation manifests and the
-  canonical NFL field coordinate template. `cvat.py` and its export/import scripts bridge
-  full-source-frame CVAT video tracks, preserve inference provenance, and limit MOT
-  references to reviewed player boxes.
+  canonical NFL field coordinate template.
+- `cvat.py` — CVAT video XML interchange through a source-hashed task-frame map that
+  preserves original source frames, integer PTS, crop transforms, and review state.
+- `identity_cues.py` — source- and base-analysis-bound jersey/appearance cues; automatic
+  cues rank review candidates, while only reviewed reliable jersey conflicts constrain
+  identity assignment.
+- `identity_review.py` — deterministic source-frame/PTS review queue construction from
+  identity-link evidence and observation tracks.
 - `scripts/fit_calibration_timeline.py` — convert a reviewed annotation manifest into the
   schema-v2 PTS-scoped calibration artifact.
 - `scripts/build_annotation_manifest.py` — create an unreviewed manifest template from the
@@ -86,9 +91,14 @@ export → evaluate → manifest.
 - `scripts/check_identity_readiness.py` — audit source-hashed calibration, timing, and
   reviewed-reference prerequisites before attempting promotion.
 - `scripts/build_play_inventory.py` — scan long recordings into unreviewed candidate shot
-  intervals for play grouping and calibration review.
-- `scripts/export_cvat.py` / `scripts/import_cvat.py` — export observations as CVAT video
-  preannotations and import explicitly reviewed tracks, timing events, and landmarks.
+  intervals and adjacent-shot play windows for review, preserving exact source PTS.
+- `scripts/export_cvat.py` / `scripts/import_cvat.py` — source-addressed local CVAT proposal
+  round-trip. Imports remain unreviewed unless explicit reviewer metadata is supplied.
+- `scripts/build_identity_review_queue.py` — order candidate links and produce an optional
+  source-frame contact sheet.
+- `scripts/propose_jersey_reads.py` — optional local Tesseract jersey-number proposals.
+- `scripts/propose_timing_events.py` — bounded, unreviewed optical-flow motion-burst
+  candidates; these are not snap/release classifications.
 - `evaluation.py` — reviewed MOT-style reference import and HOTA/IDF1-style metrics.
   Without `--reviewed-reference`, `tracking-evaluation.json` says `not_evaluated`.
 - `memory.py` — `MemoryBudget`, a peak-RSS guard (default 2048 MiB) sampled at stage

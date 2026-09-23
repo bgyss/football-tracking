@@ -32,35 +32,6 @@ def test_parser_accepts_play_selection_for_multi_play_alignment() -> None:
     assert args.play_id == "p1"
 
 
-def test_run_persists_effective_reviewed_shot_ranges_for_annotation_export(tmp_path) -> None:
-    input_path = tmp_path / "shot-segments.mp4"
-    make_video(input_path)
-    alignment_path = tmp_path / "alignment.json"
-    alignment_path.write_text(json.dumps({
-        "reviewed": True,
-        "play_id": "play-1",
-        "source_sha256": sha256_file(input_path),
-        "anchors": [
-            {"shot_id": "wide-sideline", "source_frame": 0, "event": "snap"},
-            {"shot_id": "endzone-replay", "source_frame": 2, "event": "snap"},
-        ],
-        "shot_ranges": {"wide-sideline": [0, 2], "endzone-replay": [2, 4]},
-    }), encoding="utf-8")
-    output = tmp_path / "shot-segment-run"
-
-    assert main([
-        "run", "--input", str(input_path), "--output", str(output),
-        "--detector", "synthetic", "--tracker", "iou", "--manual-cut", "2",
-        "--play-alignment", str(alignment_path),
-    ]) == 0
-
-    shots = json.loads((output / "shots.json").read_text(encoding="utf-8"))
-    assert shots["segments"] == [
-        {"shot_id": "wide-sideline", "source_shot_id": "wide-sideline", "start_frame": 0, "end_frame": 2, "play_id": "play-1"},
-        {"shot_id": "endzone-replay", "source_shot_id": "endzone-replay", "start_frame": 2, "end_frame": 4, "play_id": "play-1"},
-    ]
-
-
 def test_batch_runs_each_reviewed_play_in_its_own_directory(tmp_path) -> None:
     input_path = tmp_path / "batch.mp4"
     make_video(input_path)

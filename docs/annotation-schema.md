@@ -18,7 +18,6 @@ has corrected it and explicitly marked it reviewed.
   },
   "shots": {
     "shot-0": {
-      "source_shot_id": "shot-0",
       "start_frame": 1200,
       "end_frame": 1450,
       "play_id": "game-001-play-0042",
@@ -89,9 +88,10 @@ has corrected it and explicitly marked it reviewed.
 
 The `shots` map uses zero-based source frames with inclusive `start_frame` and exclusive
 `end_frame`. Shot ranges cannot overlap. CVAT video XML does not carry shot boundary tags;
-the export sidecar records the effective run shot segments and their source shot IDs.
-Reviewers can correct those ranges in `provenance.json` before import. Source PTS values
-remain separate from frame numbers and play time.
+the reviewed `--shot` interval supplied to `scripts/import_cvat.py` populates the manifest
+shot range. CVAT task frames are task-local; the task frame map translates them to original
+source frames and exact source PTS. Source PTS values remain separate from frame numbers
+and play time.
 
 ## Object labels and identity
 
@@ -113,7 +113,8 @@ and `LAR`) plus `unknown`. `visibility` is one of `visible`, `partially_visible`
 CVAT/MOT consumers that need the distinction. `jersey_readable` is a boolean. CVAT uses
 `review_status` values `unreviewed`, `reviewed`, `accepted`, and `rejected`. Imported
 records receive reviewed metadata only when the importer is explicitly invoked with
-`--reviewed`, `--reviewer`, and `--reviewed-at`. Each visible CVAT shape must be marked
+`--mark-reviewed`, `--reviewer`, `--revision`, `--reviewed-at`, and
+`--annotation-confidence`. Each visible CVAT shape must be marked
 `reviewed`, `accepted`, or `rejected`; an `unreviewed` or missing status stops import, and
 rejected shapes are omitted from the manifest and MOT reference. CVAT `outside` shapes
 are omitted because they have no visible box to score.
@@ -132,7 +133,7 @@ Landmarks use `image_xy_px`, `field_xy_yards`, `source_frame`, and `pts`; `role`
 or `withheld`. Each keyframe needs at least four fit landmarks and one independent
 withheld landmark to form a schema-v2 calibration timeline. A semantic `landmark_id`,
 such as `yardline:20:hash:near`, is checked against its canonical field coordinate.
-CVAT represents these as `calibration_landmark` point tracks with the field coordinates,
+CVAT represents these as `field_landmark` point tracks with the field coordinates,
 semantic ID, and fit/withheld role as attributes. Only explicit landmark keyframes are
 imported.
 
@@ -147,28 +148,21 @@ contact-quality policy is frozen and reviewed on player labels.
 
 ## CVAT bridge and provenance
 
-[`scripts/export_cvat.py`](../scripts/export_cvat.py) reads `observations.csv` from one
-run and writes CVAT for video 1.1 XML plus `provenance.json`. The XML uses the complete
-source video frame space: CVAT `frame` is the original zero-based `source_frame`, and
-each proposal carries `source_pts`, `detection_score`, team evidence, `source_run_id`,
-`source_tracklet_id`, and `proposal_player_id`. `anonymous_id` starts as `unknown` and
-`review_status` starts as `unreviewed`. The sidecar records the source hash, run and
-tracker configuration, shot ranges, the observations CSV hash, and the original rows for
-each proposal, including the source shot ID when a reviewed alignment assigned another
-effective shot name. CVAT video XML stores snap/play-time anchors as point tracks; shot
-boundaries stay in the sidecar. Keep the sidecar with the XML through review. See the [CVAT video XML
-format](https://docs.cvat.ai/docs/manual/advanced/formats/format-cvat/).
+CVAT proposals use a source-hashed `task-frame-map.json`: task-local frames map to original
+source frames and exact PTS values, with crop and resize transforms recorded. The XML
+keeps original observation rows in per-box `source_inference_row_json` attributes, along
+with the run, shot, and tracklet IDs. The exporter declares `player`, `official`, `football`,
+`timing_event`, `field_landmark`, and `ground_contact` labels. Human-added shapes have no fabricated inference
+provenance. The map and XML are stored together in the CVAT bundle; preserve the map when
+exporting corrected annotations. See the [CVAT video XML format](https://docs.cvat.ai/docs/manual/advanced/formats/format-cvat/).
 
-[`scripts/import_cvat.py`](../scripts/import_cvat.py) checks that the source video hash
-and dimensions match the sidecar, resolves each PTS from the verified source frame index,
-preserves frame numbers, and writes both
-`annotations.json` and `mot-reference.json`. A box's original inference row is retained
-under `inference_provenance` when its immutable source run, source shot, frame, and source
-tracklet still match. The reviewed `shot_id` can change while `source_shot_id` preserves
-the original inference namespace. New human-added boxes have no fabricated inference
-provenance. Only reviewed `player`
-objects enter the MOT-style reference; officials, football, timing events, and landmarks
-stay in the annotation manifest.
+[`scripts/import_cvat.py`](../scripts/import_cvat.py) verifies the source and frame map,
+then writes an annotation manifest. It can also write `mot-reference.json` with
+`--mot-reference-output`, but only when `--mark-reviewed` and reviewer metadata are
+provided. Per-shape `review_status` is checked; rejected shapes are omitted, and
+unreviewed shapes prevent promotion. The `--mot-reference-output` option writes a
+player-only reference from a fully reviewed import. The MOT converter includes only `player` boxes;
+officials, football, timing events, and landmarks remain in the annotation manifest.
 
 The example above illustrates the reviewed form. A generated preannotation is always
 `reviewed: false`; do not use it as ground truth. Reviewers must confirm source frames,
@@ -220,3 +214,49 @@ keyframe needs at least four `fit` records and one independent `withheld` record
 are bounded by the next reviewed keyframe and are never extrapolated. The generated
 timeline must carry the input `source_sha256`; the CLI refuses source-hashed mismatches
 and does not permit legacy static files to create cross-shot joins.
+
+## CVAT interchange and automated cue proposals
+
+`scripts/export_cvat.py` writes a CVAT video XML bundle with a companion
+`task-frame-map.json`. The map's `frames` list is dense in task-local frame order and each
+entry maps `task_frame` to the original `source_frame` and integer `source_pts`. It also
+stores source dimensions, frame count, time base, task dimensions, and the source crop
+rectangle. A cropped or resized box is transformed back to full-source pixels on import.
+The map is checked against the source SHA-256 and exact PTS sequence. A missing or duplicate
+frame mapping is an import error.
+
+`scripts/import_cvat.py` writes imported fields in the existing manifest contract:
+`shot_id`, `source_frame`, `pts`, `bbox_xyxy_px`, `track_id`, `label`, `visibility`, and
+`coordinate_space: "source"`. Each shape keeps the CVAT track id/source, its original
+`source_shot_id`, complete inference row when available, and review state. `ground_contact`
+point tracks attach `ground_contact_xy_px` and confidence to the
+matching player annotation. A `field_landmark` point enters `landmarks` only when it has a
+canonical semantic landmark ID and `fit` or `withheld` role; incomplete point records stay
+under `point_proposals`. Imports default to `reviewed: false`; explicit reviewer metadata
+and `--mark-reviewed` are required to promote a completed batch, and unresolved points
+prevent promotion. Non-player labels are retained in the annotation manifest but excluded
+from the MOT player reference.
+
+A reviewed cross-shot decision uses `cross_shot_review_status` (`approved`, `ambiguous`, or
+`rejected`). `approved` requires a meaningful `global_id`; `ambiguous` and `rejected` must
+leave it absent or set it to an unknown value. Every reviewed cross-shot decision also
+requires `identity_second_reviewer`, `identity_second_reviewed_at`,
+`identity_second_revision`, and `identity_second_confidence`. The second reviewer must differ
+from the annotation reviewer. A `global_id` without this approval record cannot enter the
+reviewed reference.
+
+When building an evaluator reference, pass the source-hashed schema-v2 calibration timeline
+to `scripts/build_reviewed_reference.py --calibration`. Reviewed source-pixel contacts are
+projected only where the timeline is identity-eligible and the contact lies within its
+declared support polygon. The reference records projection status; unsupported contacts
+remain unevaluated.
+
+Optional identity cues use JSON schema version 1 with a source SHA-256, a
+`base_analysis_hash`, and `tracklets` containing `jersey_reads` or
+`appearance_embeddings`. Every cue record names its `source_frame`, integer `source_pts`,
+full-source `bbox_xyxy_px`, crop-quality evidence, and review status. Appearance embedding
+records also carry a normalized `crop_quality_score`; values below 0.6 do not enter the
+appearance comparison. OCR candidates and appearance similarities remain proposals. Only a
+reviewed/accepted jersey value with high confidence can create a hard contradictory-number
+constraint. Cues must match the current run's base analysis hash, tracklet, frame, PTS, and
+box before the resolver will consume them.

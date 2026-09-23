@@ -8,6 +8,7 @@ from itertools import combinations
 from typing import Any, Mapping, Sequence
 
 from .identity import IdentityLink, TeamEvidence, match_tracklets, stable_anonymous_ids
+from .identity_cues import TrackletCues, reviewed_jersey_numbers
 from .replay import FieldTrack, cross_shot_candidate_evidence
 
 
@@ -115,6 +116,7 @@ def resolve_play_identities(
     tracklet_frames: Mapping[str, Sequence[int]] | None = None,
     tracklet_play_ids: Mapping[str, str | None] | None = None,
     tracklet_jerseys: Mapping[str, Sequence[int]] | None = None,
+    tracklet_cues: Mapping[str, TrackletCues] | None = None,
 ) -> PlayResolution:
     """Resolve all shot pairs in one reviewed play.
 
@@ -155,6 +157,7 @@ def resolve_play_identities(
             sample_tolerance_s=selected_policy.sample_tolerance_s,
             min_overlap_duration_s=selected_policy.min_overlap_duration_s,
             max_position_uncertainty_yards=selected_policy.max_position_uncertainty_yards,
+            tracklet_cues=tracklet_cues,
         )
         candidates = {key: float(record["score"]) for key, record in evidence.items() if record["eligible"] and record["score"] is not None}
         candidate_count += len(candidates)
@@ -170,7 +173,16 @@ def resolve_play_identities(
             threshold=selected_policy.threshold,
             margin=selected_policy.margin,
         )
-        pair_links = [replace(link, evidence_keys=("team_agreement", "calibrated_field_position", "trajectory_shape") if link.right_key is not None else ()) for link in pair_links]
+        enriched_links: list[IdentityLink] = []
+        for link in pair_links:
+            keys: tuple[str, ...] = ()
+            if link.right_key is not None:
+                keys = ("team_agreement", "calibrated_field_position", "trajectory_shape")
+                cue_record = evidence.get((link.left_key, link.right_key), {}).get("identity_cues", {})
+                if isinstance(cue_record, Mapping) and cue_record.get("reviewed_jersey_agreement"):
+                    keys += ("reviewed_jersey_agreement",)
+            enriched_links.append(replace(link, evidence_keys=keys))
+        pair_links = enriched_links
         all_links.extend(pair_links)
         if not any(link.decision == "same" for link in pair_links):
             failed_pairs.append((left_shot, right_shot))
@@ -181,6 +193,8 @@ def resolve_play_identities(
         # remains distinguishable from a missing view.
     tracklet_ids = [track.tracklet_id for shot_id in present for track in segments[shot_id]]
     tracklet_teams = {tracklet_id: evidence.team for tracklet_id, evidence in teams.items()}
+    if tracklet_jerseys is None and tracklet_cues is not None:
+        tracklet_jerseys = reviewed_jersey_numbers(tracklet_cues)
     accepted, rejected = _safe_component_links(
         tracklet_ids,
         all_links,

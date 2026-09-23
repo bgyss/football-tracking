@@ -18,6 +18,7 @@ from .calibration_timeline import CalibrationTimeline, load_calibration_timeline
 from .detector import Detection, RFDETRDetector, SyntheticDetector
 from .export import StageTimer, render_annotated_video, write_calibration_json, write_field_view, write_identities_json, write_manifest_json, write_metrics_json, write_observations_csv, write_observations_parquet, write_play_trajectories_csv, write_review_json, write_trajectories_csv
 from .identity import IdentityLink, TrackletSummary, resolve_teams, stable_anonymous_ids, team_feature_from_crop
+from .identity_cues import load_tracklet_cues, reviewed_jersey_numbers, validate_cues_against_observations
 from .identity_resolution import ResolutionPolicy, resolve_play_identities
 from .tracklet_refinement import refine_tracklets, tracklet_conflict_report
 from .evaluation import EvaluationError, evaluate_cross_shot_identity, evaluate_ground_contact_positions, evaluate_promotion_gates, evaluate_team_assignment, evaluate_tracking, load_cross_shot_identity, load_reviewed_mot_reference, restrict_reference_to_window
@@ -70,6 +71,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--detector-class-mapping", type=Path, default=None, help="JSON class-id mapping required to validate a controlled shared cache")
     parser.add_argument("--reviewed-reference", type=Path, default=None, help="reviewed MOT-style reference JSON; required for quality scoring")
     parser.add_argument("--team-prototypes", type=Path, default=None, help="JSON object mapping team names to RGB triples")
+    parser.add_argument("--identity-cues", type=Path, default=None, help="optional source-hashed jersey/appearance cues bound to this run's tracklet boxes")
     parser.add_argument("--calibration", type=Path, default=None, help="legacy landmark JSON or schema-v2 PTS-scoped calibration timeline")
     parser.add_argument("--play-alignment", type=Path, default=None, help="reviewed snap-anchor JSON enabling constrained cross-shot identity joins")
     parser.add_argument("--play-id", type=str, default=None, help="select one play from a multi-play alignment manifest")
@@ -165,52 +167,6 @@ def _shot_id_for_frame(
         if len(matches) > 1:
             raise ReplayAlignmentError(f"overlapping declared shot ranges cover source frame {frame_index}")
     return f"shot-{_shot_index(frame_index, boundaries)}"
-
-
-def _effective_shot_segments(
-    frame_count: int,
-    boundaries: Sequence[ShotBoundary],
-    alignment: PlayAlignment | None = None,
-) -> list[dict[str, Any]]:
-    """Return non-overlapping source intervals with the shot ids used by this run."""
-
-    cuts = {0, frame_count}
-    cuts.update(boundary.frame_index for boundary in boundaries if 0 <= boundary.frame_index <= frame_count)
-    if alignment is not None:
-        for start, end in alignment.shot_ranges.values():
-            cuts.update((start, end))
-    ordered_cuts = sorted(cuts)
-    segments: list[dict[str, Any]] = []
-    for start, end in zip(ordered_cuts, ordered_cuts[1:]):
-        if start >= end:
-            continue
-        source_shot_id = _shot_id_for_frame(start, boundaries, alignment)
-        if segments and segments[-1]["source_shot_id"] == source_shot_id and segments[-1]["end_frame"] == start:
-            segments[-1]["end_frame"] = end
-        else:
-            segments.append({"source_shot_id": source_shot_id, "start_frame": start, "end_frame": end})
-
-    counts: dict[str, int] = {}
-    for segment in segments:
-        source_shot_id = segment["source_shot_id"]
-        counts[source_shot_id] = counts.get(source_shot_id, 0) + 1
-    reserved_ids = {shot_id for shot_id, count in counts.items() if count == 1}
-    for source_shot_id, count in counts.items():
-        if count == 1:
-            continue
-        index = 0
-        for segment in segments:
-            if segment["source_shot_id"] != source_shot_id:
-                continue
-            index += 1
-            candidate = f"{source_shot_id}--segment-{index}"
-            while candidate in reserved_ids:
-                candidate += "-part"
-            segment["shot_id"] = candidate
-            reserved_ids.add(candidate)
-    for segment in segments:
-        segment.setdefault("shot_id", segment["source_shot_id"])
-    return segments
 
 
 def _build_detector(args: argparse.Namespace):
@@ -378,6 +334,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     destination.mkdir(parents=True, exist_ok=True)
     info = VideoInfo.from_path(source)
     source_hash = sha256_file(source)
+    identity_cues = None
     process_start = int(args.start_frame)
     process_end = info.frame_count if args.end_frame is None else int(args.end_frame)
     if not 0 <= process_start < process_end <= info.frame_count:
@@ -421,6 +378,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     class_mapping_hash = sha256_file(args.detector_class_mapping) if args.detector_class_mapping and args.detector_class_mapping.is_file() else None
     cache_input_hash = sha256_file(args.detection_cache) if args.detection_cache and args.detection_cache.is_file() else None
     prototypes_hash = sha256_file(args.team_prototypes) if args.team_prototypes and args.team_prototypes.is_file() else None
+    identity_cues_hash = sha256_file(args.identity_cues) if args.identity_cues and args.identity_cues.is_file() else None
     reference_hash = sha256_file(args.reviewed_reference) if args.reviewed_reference and args.reviewed_reference.is_file() else None
     split_hash = sha256_file(args.reviewed_splits) if args.reviewed_splits and args.reviewed_splits.is_file() else None
     tracker_config = {
@@ -448,6 +406,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "alignment_sha256": alignment_hash,
         "play_id": args.play_id,
         "team_prototypes_sha256": prototypes_hash,
+        "identity_cues_sha256": identity_cues_hash,
         "reviewed_splits_sha256": split_hash,
         "manual_cuts": sorted(int(cut) for cut in args.manual_cut),
         "boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries],
@@ -456,6 +415,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "contact_policy": {"source": "bottom_center", "version": 1, "min_ground_contact_confidence": 0.5},
         "team_sampling_policy": {"target_hz": 5.0, "feature_stride_frames": max(1, int(round(info.source_fps / 5.0)))},
     }
+    base_analysis_config = {**analysis_config, "identity_cues_sha256": None}
+    base_analysis_hash = config_hash(base_analysis_config)
+    if args.identity_cues:
+        identity_cues = load_tracklet_cues(args.identity_cues, source_sha256=source_hash, analysis_hash=base_analysis_hash)
     analysis_hash = config_hash(analysis_config)
     run_id = f"run-{source_hash[:12]}-{args.tracker}-{analysis_hash[:8]}"
     cache_path = args.detection_cache or destination / "detections.jsonl"
@@ -630,6 +593,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 support_polygon_px=estimate.support_polygon_px if estimate is not None else None,
             )
         observations.append(observation)
+    if identity_cues is not None:
+        validate_cues_against_observations(identity_cues, observations)
     if alignment is not None:
         link_report["timing_status"] = "validated_pts_map" if alignment.timing_eligible else "unverified_alignment_source" if alignment.time_map is not None and not alignment.source_hash_validated else "reviewed_pts_map" if alignment.time_map is not None else "legacy_unvalidated_equal_rate"
         if alignment.timing_report is not None:
@@ -689,6 +654,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 policy=ResolutionPolicy(threshold=args.identity_threshold, margin=args.identity_margin, max_field_distance_yards=args.identity_max_distance_yards, min_overlap_duration_s=args.identity_min_overlap_duration_s, max_position_uncertainty_yards=args.identity_max_position_uncertainty_yards),
                 tracklet_frames=tracklet_frames,
                 tracklet_play_ids={tracklet_id: alignment.play_id for tracklet_id in tracklet_ids},
+                tracklet_cues=identity_cues,
             )
             identity_links = [link for link in resolution.links if link.decision == "same"]
             link_report = resolution.to_dict()
@@ -710,6 +676,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         tracklet_frames=tracklet_frames,
         tracklet_play_ids={tracklet_id: alignment.play_id if alignment is not None else None for tracklet_id in tracklet_ids},
         tracklet_teams={tracklet_id: evidence.team for tracklet_id, evidence in teams.items()},
+        tracklet_jerseys=reviewed_jersey_numbers(identity_cues) if identity_cues is not None else None,
     )
     observations = [
         replace(observation, player_id=identity_map.get(observation.tracklet_id))
@@ -720,6 +687,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         by_player.setdefault(player_id, set()).add(tracklet_id.split(":", 1)[0])
     link_report.update({
         "schema_version": 2,
+        "source_sha256": source_hash,
         "shot_count": len(boundaries),
         "tracklet_count": len(tracklet_ids),
         "player_id_count": len(set(identity_map.values())),
@@ -729,6 +697,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             for link in identity_links
         ]),
     })
+    if identity_cues is not None:
+        link_report["identity_cue_source"] = {
+            "sha256": identity_cues_hash,
+            "tracklet_count": len(identity_cues),
+            "jersey_read_count": sum(len(cues.jersey_reads) for cues in identity_cues.values()),
+            "appearance_embedding_count": sum(len(cues.appearance_embeddings) for cues in identity_cues.values()),
+            "use_policy": "unreviewed cues rank review candidates; only reviewed reliable jersey conflicts reject candidate edges",
+        }
     with timer.stage("export"):
         write_observations_csv(destination / "observations.csv", observations)
         write_observations_parquet(destination / "observations.parquet", observations)
@@ -736,11 +712,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         write_play_trajectories_csv(destination / "play-trajectories.csv", observations)
         write_identities_json(destination / "identities.json", identity_map)
         write_metrics_json(destination / "identity-links.json", link_report)
-        write_metrics_json(destination / "analysis-config.json", {"schema_version": 2, "analysis_hash": analysis_hash, "source_sha256": source_hash, "analysis": analysis_config, "detector": detector_config, "tracker": tracker_config, "evaluation_reference_sha256": reference_hash, "cache": {"path": str(cache_path), "sha256": cache_input_hash, "strict_shared": strict_shared_cache, "provenance": expected_provenance}})
-        shot_segments = _effective_shot_segments(info.frame_count, boundaries, alignment)
-        for segment in shot_segments:
-            segment["play_id"] = alignment.play_id if alignment is not None and segment["source_shot_id"] in alignment.shots() else None
-        write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges, "segments": shot_segments})
+        write_metrics_json(destination / "analysis-config.json", {"schema_version": 2, "analysis_hash": analysis_hash, "base_analysis_hash": base_analysis_hash, "source_sha256": source_hash, "analysis": analysis_config, "detector": detector_config, "tracker": tracker_config, "evaluation_reference_sha256": reference_hash, "cache": {"path": str(cache_path), "sha256": cache_input_hash, "strict_shared": strict_shared_cache, "provenance": expected_provenance}})
+        write_metrics_json(destination / "shots.json", {"boundaries": [{"frame_index": boundary.frame_index, "pts": boundary.pts, "reason": boundary.reason, "confidence": boundary.confidence} for boundary in boundaries], "ranges": ranges})
         trajectories: dict[tuple[str, str], list[tuple[float, float]]] = {}
         for observation in observations:
             if observation.player_id and observation.field_xy_yards is not None:
@@ -837,7 +810,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "detector_provenance_known": detector_provenance_known,
         "detection_cache_hit": cached is not None,
         "detector_cache": {"path": str(cache_path), "strict_shared": strict_shared_cache, "provenance": expected_provenance, "frame_start": process_start, "frame_end": process_end},
-        "analysis": {"schema_version": 2, "analysis_hash": analysis_hash, "calibration_sha256": calibration_hash, "alignment_sha256": alignment_hash, "detector_class_mapping_sha256": class_mapping_hash, "detection_cache_sha256": cache_input_hash, "play_id": args.play_id, "team_prototypes_sha256": prototypes_hash, "reviewed_splits_sha256": split_hash, "reference_sha256": reference_hash, "boundary_count": len(boundaries)},
+        "analysis": {"schema_version": 2, "analysis_hash": analysis_hash, "base_analysis_hash": base_analysis_hash, "calibration_sha256": calibration_hash, "alignment_sha256": alignment_hash, "detector_class_mapping_sha256": class_mapping_hash, "detection_cache_sha256": cache_input_hash, "play_id": args.play_id, "team_prototypes_sha256": prototypes_hash, "identity_cues_sha256": identity_cues_hash, "reviewed_splits_sha256": split_hash, "reference_sha256": reference_hash, "boundary_count": len(boundaries)},
         "calibration": calibration_quality,
         "window": {"start_frame": process_start, "end_frame": process_end, "processed_frame_count": process_end - process_start, "source_frame_count": info.frame_count},
         "tracker_config": tracker_config,
