@@ -2,6 +2,108 @@
 
 The baseline campaign was drafted September 10, 2026. The McByte follow-up campaign was drafted September 14, 2026. Each platform section contains ready-to-copy post text. The long-term goal is full reconstruction of football plays from All-22 footage.
 
+## CVAT and Identity: Automating the Learning Loop
+
+Drafted September 23, 2026 against local commit `a0d7333`. Copy below is ready to
+paste; attachment instructions and claim notes are separate from the posts.
+
+### LinkedIn: The Learning Loop
+
+I'm working toward completely automating the fine-tuning loop for my All-22 football tracking project, with a bigger goal: processing game film faster and reconstructing plays more accurately.
+
+The current focus is CVAT and player identity. Football makes both difficult: distant players, nearly identical uniforms, crowded contact, and a sideline view followed by an end-zone replay of the same action.
+
+I've added a local CVAT import/export bridge so model-generated tracks can be corrected and brought back into the pipeline. Those corrections keep their original source frames, timestamps, and model-output provenance. The identity tooling also builds review queues for candidate matches across views, with uncertain cases allowed to remain unresolved.
+
+The loop I'm building toward is:
+
+Process footage → surface difficult cases → review and preserve corrections → fine-tune → evaluate on held-out games → repeat.
+
+The aim is to make each round of review produce reusable training data and reduce the manual effort required for the next game. Better detection is one part of that; keeping the same player identity through contact and across replay angles needs its own evaluation.
+
+Human review is still part of the workflow today. End-to-end retraining automation and measured speed and accuracy gains are the next steps, rather than results I'm claiming already.
+
+Ultimately, I want to turn All-22 into a reliable account of who moved where, when, and how the views fit together.
+
+Project: https://github.com/bgyss/football-tracking
+
+#ComputerVision #FootballAnalytics #MachineLearning
+
+### Reddit: Technical Discussion
+
+#### Title
+
+Building toward an automated All-22 fine-tuning loop: CVAT corrections and cross-view player identity
+
+#### Body
+
+I'm building an offline All-22 football tracking project. The long-term goal is to completely automate the fine-tuning process so I can process footage faster and reconstruct plays more accurately. Right now, I'm working on the annotation and identity pieces that make that loop possible.
+
+The baseline uses Roboflow's RF-DETR for detection and BoT-SORT for tracking. The difficult part is turning those outputs into useful supervision without carrying the model's mistakes straight into the next training set.
+
+The latest work includes:
+
+- A local CVAT video XML bridge for exporting proposal tracks and importing corrections. A source-hashed frame map preserves original frame numbers, timestamps, and crop coordinates; raw inference provenance stays attached.
+- Reviewed annotation manifests and a player-only MOT reference export. Imports stay unreviewed by default, and the reference export requires explicit review.
+- Identity review queues containing candidate links, competing matches, and unmatched tracks, addressed back to the original footage.
+- Cross-view identity logic using validated field calibration, aligned play time, team evidence, and trajectory information. It can abstain when the evidence is insufficient.
+- Optional jersey-number proposals to help rank review cases. Automatic jersey reads do not establish identity by themselves.
+
+A sideline shot and an end-zone replay can show the same play at different video times. Treating them as one continuous track would create a misleading reconstruction. The aim is to align them in play time and field coordinates before deciding which tracks belong to the same player.
+
+The intended learning loop is: run inference, prioritize difficult cases, review corrections in CVAT, curate detector-training labels, fine-tune, and evaluate on held-out games before adopting a new checkpoint. Both views of a play need to stay in the same data split.
+
+I'm keeping detector labels and identity references separate. Better boxes do not automatically prove fewer identity switches. Detection quality, identity continuity, cross-view matching, and processing cost each need their own measurements.
+
+Current status: the local interchange and identity-review tooling is implemented. Fully automated retraining is still the goal; human review remains necessary, and I don't yet have a held-out result showing improved reconstruction accuracy or throughput. The attached diagrams illustrate the workflow, not benchmark results or a CVAT UI session.
+
+Repo: https://github.com/bgyss/football-tracking
+
+For people working on sports video or active learning: how do you choose which crowded-contact or cross-view identity cases are worth annotating next?
+
+### X: Standalone Post
+
+I'm working toward fully automating fine-tuning for All-22: CVAT corrections, player identity, retraining, evaluation. The goal: faster film processing and more accurate play reconstruction. Human review is still part of the loop. https://github.com/bgyss/football-tracking
+
+### X: Optional Four-Post Thread
+
+#### 1
+
+I'm building toward an automated fine-tuning loop for All-22 football footage. The goal: process film faster and reconstruct plays more accurately. The current work is CVAT + player identity. https://github.com/bgyss/football-tracking
+
+#### 2
+
+The CVAT bridge exports proposal tracks and imports corrections while preserving original frames, timestamps, and model provenance. Imports stay unreviewed by default. Identity review queues help surface candidate matches and competing explanations.
+
+#### 3
+
+Same player, different camera, different video time. Cross-view identity needs field calibration and aligned play time. Jersey reads can help rank review cases, but uncertain matches stay unresolved. Better boxes alone don't prove better identity.
+
+#### 4
+
+The loop I'm aiming for: inference → hard cases → reviewed labels → fine-tuning → held-out evaluation → repeat. Human review remains today. Automated retraining and measured speed/accuracy gains are still ahead. https://github.com/bgyss/football-tracking
+
+### Attachments and Alt Text
+
+Use the learning-loop graphic first on LinkedIn and with the standalone X post.
+Use both graphics for Reddit, or attach the identity graphic to post 3 of the X thread.
+The PNGs are upload-ready 1600 × 1000 images; the SVGs are editable originals.
+
+- **Learning loop:** [PNG](social/2026-09-23-cvat-identity/learning-loop.png) · [SVG](social/2026-09-23-cvat-identity/learning-loop.svg).
+  Alt text: Diagram of an All-22 learning loop: footage, detection and tracking, human CVAT review, preserved reviewed labels, planned detector fine-tuning, and planned held-out evaluation. Implemented tooling, human review, and future automation are labeled separately. Detection boxes train the detector; persistent tracks test identity.
+- **Cross-view identity:** [PNG](social/2026-09-23-cvat-identity/cross-view-identity.png) · [SVG](social/2026-09-23-cvat-identity/cross-view-identity.svg).
+  Alt text: Schematic of sideline and end-zone views mapping into shared field coordinates at aligned play time. Candidate player tracks are compared using geometry, timing, team, and motion. Automatic jersey cues help review; weak evidence leaves identity unresolved. The positions are illustrative, not measured tracking results.
+
+### Editorial Claim Notes — Do Not Paste
+
+- Verified against the current checkout: [CVAT workflow](annotation-and-data-generation.md), [import script](../scripts/import_cvat.py), [CVAT source](../src/football_tracking/cvat.py), [identity resolver](../src/football_tracking/identity_resolution.py), and [review queue](../src/football_tracking/identity_review.py).
+- The [September 22 implementation note](evidence/cross-shot-identity-automation-research-2026-09-22.md#implementation-status) records generated-video interface checks, not full-game labeling or a live CVAT UI round-trip. No new model run, human annotation, or accuracy benchmark was performed for this campaign.
+- Complete retraining orchestration, reduced annotation effort, faster processing, and better reconstruction accuracy are goals. These drafts do not claim a measured improvement or a completed autonomous training system.
+- Reconstruction here means player identities and field trajectories across views; full play reconstruction remains the broader goal. No completed 3D reconstruction, named-player recognition, or ball-possession result is implied.
+- CVAT is the annotation integration and Roboflow RF-DETR is the detector; these posts describe this project's integration and workflow, not authorship of those upstream tools.
+- Both visual aids are original vector schematics. They contain no game footage, measured trajectories, benchmark values, or simulated CVAT screenshots.
+- X drafts are checked against the [standard 280-character post limit](https://help.x.com/en/using-x/how-to-post), including the full written repository URL as a conservative count.
+
 ## McByte Follow-Up Campaign
 
 This campaign is a three-part sequence: the integration milestone, the identity-verification gate, and the football-specific fine-tuning loop. The posts deliberately distinguish a working mask-assisted run from measured identity accuracy.
