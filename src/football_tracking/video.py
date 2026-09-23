@@ -53,7 +53,10 @@ def _ffprobe(path: Path, *entries: str) -> dict | None:
 
 
 @lru_cache(maxsize=16)
-def _frame_pts_cached(path_text: str) -> tuple[int, ...]:
+def _frame_pts_cached(path_text: str, source_mtime_ns: int, source_size: int) -> tuple[int, ...]:
+    # Metadata participates in the key so replacing a source file in place does
+    # not reuse an old PTS index for the new content.
+    del source_mtime_ns, source_size
     path = Path(path_text)
     command = [
         "ffprobe",
@@ -83,7 +86,11 @@ def _frame_pts_cached(path_text: str) -> tuple[int, ...]:
 
 
 def _frame_pts(path: Path) -> list[int]:
-    return list(_frame_pts_cached(str(path)))
+    try:
+        source_stat = path.stat()
+    except OSError:
+        return []
+    return list(_frame_pts_cached(str(path), int(source_stat.st_mtime_ns), int(source_stat.st_size)))
 
 
 def frame_pts(path: str | Path) -> tuple[int, ...]:

@@ -107,3 +107,48 @@ keyframe needs at least four `fit` records and one independent `withheld` record
 are bounded by the next reviewed keyframe and are never extrapolated. The generated
 timeline must carry the input `source_sha256`; the CLI refuses source-hashed mismatches
 and does not permit legacy static files to create cross-shot joins.
+
+## CVAT interchange and automated cue proposals
+
+`scripts/export_cvat.py` writes a CVAT video XML bundle with a companion
+`task-frame-map.json`. The map's `frames` list is dense in task-local frame order and each
+entry maps `task_frame` to the original `source_frame` and integer `source_pts`. It also
+stores source dimensions, frame count, time base, task dimensions, and the source crop
+rectangle. A cropped or resized box is transformed back to full-source pixels on import.
+The map is checked against the source SHA-256 and exact PTS sequence. A missing or duplicate
+frame mapping is an import error.
+
+`scripts/import_cvat.py` writes imported fields in the existing manifest contract:
+`shot_id`, `source_frame`, `pts`, `bbox_xyxy_px`, `track_id`, `label`, `visibility`, and
+`coordinate_space: "source"`. Each shape keeps the CVAT track id/source and its review
+state. `ground_contact` point tracks attach `ground_contact_xy_px` and confidence to the
+matching player annotation. A `field_landmark` point enters `landmarks` only when it has a
+canonical semantic landmark ID and `fit` or `withheld` role; incomplete point records stay
+under `point_proposals`. Imports default to `reviewed: false`; explicit reviewer metadata
+and `--mark-reviewed` are required to promote a completed batch, and unresolved points
+prevent promotion. Non-player labels are retained in the annotation manifest but excluded
+from the MOT player reference.
+
+A reviewed cross-shot decision uses `cross_shot_review_status` (`approved`, `ambiguous`, or
+`rejected`). `approved` requires a meaningful `global_id`; `ambiguous` and `rejected` must
+leave it absent or set it to an unknown value. Every reviewed cross-shot decision also
+requires `identity_second_reviewer`, `identity_second_reviewed_at`,
+`identity_second_revision`, and `identity_second_confidence`. The second reviewer must differ
+from the annotation reviewer. A `global_id` without this approval record cannot enter the
+reviewed reference.
+
+When building an evaluator reference, pass the source-hashed schema-v2 calibration timeline
+to `scripts/build_reviewed_reference.py --calibration`. Reviewed source-pixel contacts are
+projected only where the timeline is identity-eligible and the contact lies within its
+declared support polygon. The reference records projection status; unsupported contacts
+remain unevaluated.
+
+Optional identity cues use JSON schema version 1 with a source SHA-256, a
+`base_analysis_hash`, and `tracklets` containing `jersey_reads` or
+`appearance_embeddings`. Every cue record names its `source_frame`, integer `source_pts`,
+full-source `bbox_xyxy_px`, crop-quality evidence, and review status. Appearance embedding
+records also carry a normalized `crop_quality_score`; values below 0.6 do not enter the
+appearance comparison. OCR candidates and appearance similarities remain proposals. Only a
+reviewed/accepted jersey value with high confidence can create a hard contradictory-number
+constraint. Cues must match the current run's base analysis hash, tracklet, frame, PTS, and
+box before the resolver will consume them.
