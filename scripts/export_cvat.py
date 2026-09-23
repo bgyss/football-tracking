@@ -84,6 +84,10 @@ def export_observations(
     cvat_track_number = 0
     for tracklet_id, values in sorted(grouped.items()):
         values.sort(key=lambda item: item[0])
+        run_ids = {str(row.get("run_id", "")).strip() for _, row in values}
+        if len(run_ids) != 1 or not next(iter(run_ids)):
+            raise CvatError(f"observations for {tracklet_id} must come from one run with a run_id")
+        run_id = next(iter(run_ids))
         segments: list[list[tuple[int, dict[str, str]]]] = []
         for frame, row in values:
             if not segments or frame - segments[-1][-1][0] > max_gap_frames + 1:
@@ -108,6 +112,7 @@ def export_observations(
                     "detection_score": row.get("detection_score", ""),
                     "team_suggestion": row.get("team", "unknown"),
                     "team_score": row.get("team_score", "0"),
+                    "source_inference_row_json": json.dumps(row, sort_keys=True, separators=(",", ":")),
                     "ground_contact_proposal_xy_px": json.dumps([round((clipped[0] + clipped[2]) / 2.0, 3), round(clipped[3], 3)], separators=(",", ":")),
                     "review_status": "unreviewed",
                 }
@@ -121,6 +126,8 @@ def export_observations(
                 {
                     "tracklet_id": tracklet_id,
                     "proposal_segment": segment_index,
+                    "source_run_id": run_id,
+                    "source_shot_id": shot_id,
                     "source_sha256": frame_map.source_sha256,
                     "review_status": "unreviewed",
                 },
@@ -182,10 +189,14 @@ def export_observations(
         frame_map,
         task_name=task_name,
         label_attributes={
-            "player": ("team", "global_id", "jersey_number", "visibility", "review_status", "ground_contact_xy_yards", "ground_contact_confidence", "cross_shot_review_status", "identity_second_reviewer", "identity_second_reviewed_at", "identity_second_revision", "identity_second_confidence"),
+            "player": ("team", "global_id", "jersey_number", "visibility", "review_status", "ground_contact_xy_yards", "ground_contact_confidence", "cross_shot_review_status", "identity_second_reviewer", "identity_second_reviewed_at", "identity_second_revision", "identity_second_confidence", "source_run_id", "source_shot_id", "source_inference_row_json"),
+            "official": ("team", "visibility", "review_status"),
+            "football": ("visibility", "review_status"),
             "ground_contact": ("tracklet_id", "proposal_method", "source_sha256", "review_status", "ground_contact_confidence"),
             "field_landmark": ("proposal_id", "landmark_id", "role", "source_sha256", "review_status", "field_x_yards", "field_y_yards"),
+            "timing_event": ("event", "play_id", "correspondence_id", "play_time_s", "source_frame", "source_pts", "review_status"),
         },
+        point_labels=("field_landmark", "ground_contact", "timing_event"),
     )
     write_cvat_bundle(output_path, xml_bytes, frame_map)
     cvat_xml_path = cvat_xml_output or output_path.with_suffix(".xml")

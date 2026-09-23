@@ -83,14 +83,20 @@ After human review, import the corrected CVAT XML plus its sidecar into the repo
 
 ```bash
 UV_CACHE_DIR=.uv-cache uv run python scripts/import_cvat.py \
-  --input artifacts/game-001/shot-12-reviewed.zip \
+  --input artifacts/game-001/shot-12-reviewed.xml \
   --frame-map artifacts/game-001/shot-12-task-frame-map.json \
   --source data/game-001.mp4 \
   --shot shot-12:12000:13350:sideline:play-0042:development \
-  --output artifacts/game-001/shot-12-annotations.json
+  --output artifacts/game-001/shot-12-annotations.json \
+  --mark-reviewed \
+  --reviewer reviewer-1 \
+  --revision 1 \
+  --reviewed-at 2026-09-23T12:00:00Z \
+  --annotation-confidence 1.0 \
+  --mot-reference-output artifacts/game-001/shot-12-mot-reference.json
 ```
 
-The importer verifies source hash, dimensions, frame count, time base, exact PTS, and crop mapping. It emits `reviewed: false` by default. Use `--mark-reviewed --reviewer NAME --revision N --reviewed-at ISO_TIMESTAMP --annotation-confidence 1.0` only after checking every imported shape and frame tag in CVAT; the confidence value must be between 0 and 1. A proposal import cannot become evaluation truth by itself.
+The importer verifies source hash, dimensions, frame count, time base, exact PTS, and crop mapping. It emits `reviewed: false` by default. Use `--mark-reviewed` and reviewer metadata only after checking every imported shape and frame tag in CVAT; each visible shape must be `reviewed` or `accepted`, while `rejected` shapes are omitted. `--mot-reference-output` writes a player-only MOT reference and requires a fully reviewed manifest. A proposal import cannot become evaluation truth by itself.
 
 The exporter also creates unreviewed `ground_contact` point tracks at each proposal box's bottom center. In CVAT, correct each point to the visible ground contact and set a confidence. Pass the valid calibration timeline to `scripts/build_reviewed_reference.py --calibration` to project reviewed source pixels into field yards.
 

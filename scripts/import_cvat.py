@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from football_tracking.annotations import load_annotation_manifest
+from football_tracking.annotations import load_annotation_manifest, mot_reference_from_manifest
 from football_tracking.cvat import CvatError, TaskFrameMap, manifest_annotations_from_cvat, parse_cvat_video_xml, read_cvat_bundle
 from football_tracking.metrics import sha256_file
 from football_tracking.video import VideoInfo, frame_pts
@@ -29,7 +31,7 @@ def _shot(value: str) -> dict[str, Any]:
 
 
 def _all_records_reviewed(value: dict[str, Any]) -> bool:
-    for collection_name in ("annotations", "landmarks", "frame_labels"):
+    for collection_name in ("annotations", "landmarks", "frame_labels", "timing_events"):
         collection = value.get(collection_name, [])
         if not isinstance(collection, list):
             return False
@@ -39,6 +41,18 @@ def _all_records_reviewed(value: dict[str, Any]) -> bool:
             if not all(record.get(key) not in (None, "") for key in ("reviewer", "revision", "reviewed_at", "annotation_confidence")):
                 return False
     return True
+
+
+def _stage_json(destination: Path, value: dict[str, Any]) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".import-tmp", dir=destination.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return temporary_path
 
 
 def import_cvat(
@@ -54,6 +68,7 @@ def import_cvat(
     revision: int | None = None,
     reviewed_at: str | None = None,
     annotation_confidence: float | None = None,
+    mot_reference_output: Path | None = None,
 ) -> None:
     source_hash = sha256_file(source_path)
     info = VideoInfo.from_path(source_path)
@@ -74,7 +89,7 @@ def import_cvat(
     task_width, task_height = frame_map.frames[0].task_width, frame_map.frames[0].task_height
     if parsed_xml.task_width is not None and (parsed_xml.task_width, parsed_xml.task_height) != (task_width, task_height):
         raise CvatError("CVAT task dimensions do not match the source frame map crop transform")
-    annotations, landmarks, frame_labels, point_proposals = manifest_annotations_from_cvat(
+    annotations, landmarks, frame_labels, point_proposals, timing_events = manifest_annotations_from_cvat(
         parsed_xml,
         frame_map,
         shot_id=shot["shot_id"],
@@ -85,7 +100,7 @@ def import_cvat(
         reviewed_at=reviewed_at,
         annotation_confidence=annotation_confidence,
     )
-    if mark_reviewed and not annotations and not landmarks and not frame_labels:
+    if mark_reviewed and not annotations and not landmarks and not frame_labels and not timing_events:
         raise CvatError("cannot promote an empty CVAT import to reviewed")
     if mark_reviewed and point_proposals:
         raise CvatError(f"cannot promote import with {len(point_proposals)} unresolved point proposals; assign landmark semantics/roles or complete the point tracks first")
@@ -108,10 +123,12 @@ def import_cvat(
             "shots": {shot["shot_id"]: {key: shot[key] for key in ("start_frame", "end_frame", "play_id", "split", "camera_label")}},
             "annotations": [],
             "landmarks": [],
+            "timing_events": [],
             "frame_labels": [],
         }
     value.setdefault("annotations", []).extend(annotations)
     value.setdefault("landmarks", []).extend(landmarks)
+    value.setdefault("timing_events", []).extend(timing_events)
     value.setdefault("frame_labels", []).extend(frame_labels)
     value.setdefault("point_proposals", []).extend(point_proposals)
     value["reviewed"] = bool(mark_reviewed and not value.get("point_proposals") and _all_records_reviewed(value))
@@ -126,16 +143,54 @@ def import_cvat(
         "review_status": "reviewed" if value["reviewed"] else "unreviewed",
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f".{output_path.name}.import-tmp")
+    if mot_reference_output is not None:
+        if not value["reviewed"]:
+            raise CvatError("MOT reference output requires a fully reviewed import")
+        if mot_reference_output.resolve() == output_path.resolve():
+            raise CvatError("MOT reference output must differ from the annotation manifest output")
+    temporary_path = None
+    reference_temporary_path = None
+    manifest_backup_path = None
     try:
-        temporary_path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary_path = _stage_json(output_path, value)
         if value["reviewed"]:
-            load_annotation_manifest(temporary_path, source_hash, require_reviewed=True)
+            parsed = load_annotation_manifest(temporary_path, source_hash, require_reviewed=True)
         else:
-            load_annotation_manifest(temporary_path, source_hash, require_reviewed=False)
-        temporary_path.replace(output_path)
+            parsed = load_annotation_manifest(temporary_path, source_hash, require_reviewed=False)
+        if mot_reference_output is not None:
+            reference = mot_reference_from_manifest(parsed)
+            mot_reference_output.parent.mkdir(parents=True, exist_ok=True)
+            reference_temporary_path = _stage_json(mot_reference_output, reference)
+            if output_path.exists():
+                descriptor, backup_name = tempfile.mkstemp(prefix=f".{output_path.name}.", suffix=".import-backup", dir=output_path.parent)
+                os.close(descriptor)
+                manifest_backup_path = Path(backup_name)
+                manifest_backup_path.unlink()
+                output_path.replace(manifest_backup_path)
+            try:
+                temporary_path.replace(output_path)
+                temporary_path = None
+                reference_temporary_path.replace(mot_reference_output)
+                reference_temporary_path = None
+            except Exception:
+                output_path.unlink(missing_ok=True)
+                if manifest_backup_path is not None and manifest_backup_path.exists():
+                    manifest_backup_path.replace(output_path)
+                    manifest_backup_path = None
+                raise
+            if manifest_backup_path is not None:
+                manifest_backup_path.unlink(missing_ok=True)
+                manifest_backup_path = None
+        else:
+            temporary_path.replace(output_path)
+            temporary_path = None
     except Exception:
-        temporary_path.unlink(missing_ok=True)
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        if reference_temporary_path is not None:
+            reference_temporary_path.unlink(missing_ok=True)
+        if manifest_backup_path is not None and manifest_backup_path.exists() and not output_path.exists():
+            manifest_backup_path.replace(output_path)
         raise
 
 
@@ -147,6 +202,7 @@ def main() -> int:
     parser.add_argument("--shot", type=_shot, required=True, help="shot_id:start_frame:end_frame:camera_label:play_id:split")
     parser.add_argument("--annotation-template", type=Path, help="existing manifest template to extend")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mot-reference-output", type=Path, help="optional MOT-style JSON reference output; requires --mark-reviewed")
     parser.add_argument("--mark-reviewed", action="store_true", help="promote this imported batch after full human review")
     parser.add_argument("--reviewer")
     parser.add_argument("--revision", type=int)
@@ -154,7 +210,7 @@ def main() -> int:
     parser.add_argument("--annotation-confidence", type=float)
     args = parser.parse_args()
     try:
-        import_cvat(args.input, args.source, args.output, shot=args.shot, frame_map_path=args.frame_map, template_path=args.annotation_template, mark_reviewed=args.mark_reviewed, reviewer=args.reviewer, revision=args.revision, reviewed_at=args.reviewed_at, annotation_confidence=args.annotation_confidence)
+        import_cvat(args.input, args.source, args.output, shot=args.shot, frame_map_path=args.frame_map, template_path=args.annotation_template, mark_reviewed=args.mark_reviewed, reviewer=args.reviewer, revision=args.revision, reviewed_at=args.reviewed_at, annotation_confidence=args.annotation_confidence, mot_reference_output=args.mot_reference_output)
     except (CvatError, OSError, ValueError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
     return 0

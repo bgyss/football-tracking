@@ -353,6 +353,17 @@ def _read_attributes(parent: ET.Element) -> dict[str, str]:
     return result
 
 
+def _import_review_status(attributes: Mapping[str, str], *, reviewed: bool, label: str, frame: int) -> str | None:
+    status = str(attributes.get("review_status", "")).strip()
+    if status == "rejected":
+        return None
+    if not reviewed:
+        return "unreviewed"
+    if status not in {"reviewed", "accepted"}:
+        raise CvatError(f"CVAT {label} at source frame {frame} must be reviewed or accepted before promotion")
+    return status
+
+
 def parse_cvat_video_xml(xml_bytes: bytes | str) -> CvatAnnotations:
     """Parse CVAT video track XML 1.1 into deterministic typed records."""
 
@@ -448,9 +459,9 @@ def write_cvat_video_xml(
     frame_map: TaskFrameMap,
     *,
     task_name: str = "football-tracking-proposals",
-    labels: Sequence[str] = ("player", "official", "football", "field_landmark", "ground_contact"),
+    labels: Sequence[str] = ("player", "official", "football", "field_landmark", "ground_contact", "timing_event"),
     label_attributes: Mapping[str, Sequence[str]] | None = None,
-    point_labels: Sequence[str] = ("field_landmark", "ground_contact"),
+    point_labels: Sequence[str] = ("field_landmark", "ground_contact", "timing_event"),
     tags: Iterable[CvatTag] = (),
 ) -> bytes:
     """Serialize CVAT video XML 1.1 and reject shapes outside the frame map."""
@@ -491,9 +502,9 @@ def write_cvat_video_xml(
                 | {attribute for box in track_data.boxes for attribute in (box.attributes or {})}
             )
         } | {str(name) for name in (label_attributes or {}).get(label_name, ())})
-        label_attributes = ET.SubElement(label, "attributes")
+        label_attributes_node = ET.SubElement(label, "attributes")
         for attribute_name in attribute_names:
-            attribute = ET.SubElement(label_attributes, "attribute")
+            attribute = ET.SubElement(label_attributes_node, "attribute")
             ET.SubElement(attribute, "name").text = attribute_name
             ET.SubElement(attribute, "mutable").text = "True"
             ET.SubElement(attribute, "input_type").text = "text"
@@ -587,7 +598,7 @@ def manifest_annotations_from_cvat(
     revision: int | None = None,
     reviewed_at: str | None = None,
     annotation_confidence: float | None = None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Convert CVAT player tracks and frame tags into manifest records."""
 
     if not shot_id:
@@ -607,7 +618,8 @@ def manifest_annotations_from_cvat(
     landmarks: list[dict[str, Any]] = []
     frame_labels: list[dict[str, Any]] = []
     point_proposals: list[dict[str, Any]] = []
-    contact_points: dict[tuple[str, int], tuple[tuple[float, float], float | None, dict[str, str]]] = {}
+    timing_events: list[dict[str, Any]] = []
+    contact_points: dict[tuple[str, int], tuple[tuple[float, float], float | None, dict[str, str], str]] = {}
     for track in annotations.tracks:
         tracklet_id = str(track.attributes.get("tracklet_id") or track.attributes.get("source_tracklet_id") or f"cvat-track-{track.track_id}")
         if track.points:
@@ -617,6 +629,12 @@ def manifest_annotations_from_cvat(
                 mapped = source_by_task[point_shape.task_frame]
                 if not start_frame <= mapped.source_frame < end_frame:
                     raise CvatError(f"CVAT point frame {mapped.source_frame} lies outside declared shot {shot_id}")
+                # Only explicit visible points can define timing anchors or
+                # calibration landmarks. CVAT may carry stale interpolated
+                # attributes on keyframe=0 shapes, so discard these before
+                # interpreting per-shape metadata.
+                if not point_shape.keyframe or point_shape.outside:
+                    continue
                 attributes = {**track.attributes, **(point_shape.attributes or {})}
                 if attributes.get("source_sha256") not in (None, "", frame_map.source_sha256):
                     raise CvatError(f"CVAT point track {track.track_id} source hash does not match task frame map")
@@ -628,13 +646,42 @@ def manifest_annotations_from_cvat(
                             raise CvatError(f"invalid {key} attribute on point track {track.track_id}") from error
                         if actual != expected:
                             raise CvatError(f"CVAT {key} attribute disagrees with task frame map at task frame {point_shape.task_frame}")
+                review_status = _import_review_status(attributes, reviewed=reviewed, label=track.label, frame=mapped.source_frame)
+                if review_status is None:
+                    continue
                 if point_shape.outside or len(point_shape.points_xy_px) != 1:
                     point_proposals.append({"shot_id": shot_id, "source_frame": mapped.source_frame, "pts": mapped.source_pts, "label": track.label, "outside": point_shape.outside, "review_status": "unreviewed", "attributes": dict(sorted(attributes.items()))})
                     continue
                 source_point = task_point_to_source(point_shape.points_xy_px[0], mapped)
                 if not 0 <= source_point[0] <= frame_map.source_width or not 0 <= source_point[1] <= frame_map.source_height:
                     raise CvatError(f"imported point lies outside source image at frame {mapped.source_frame}")
-                if track.label == "ground_contact":
+                if track.label == "timing_event":
+                    event = str(attributes.get("event", "")).strip()
+                    if not event:
+                        point_proposals.append({"shot_id": shot_id, "source_frame": mapped.source_frame, "pts": mapped.source_pts, "label": track.label, "image_xy_px": list(source_point), "review_status": "unreviewed", "attributes": dict(sorted(attributes.items()))})
+                        continue
+                    timing_event: dict[str, Any] = {
+                        "id": f"{shot_id}:{mapped.source_frame}:event-{track.track_id}",
+                        "shot_id": shot_id,
+                        "source_frame": mapped.source_frame,
+                        "pts": mapped.source_pts,
+                        "event": event,
+                        "play_id": attributes.get("play_id") or None,
+                        "correspondence_id": attributes.get("correspondence_id") or None,
+                        "review_status": review_status,
+                    }
+                    if attributes.get("play_time_s") not in (None, ""):
+                        try:
+                            play_time = float(attributes["play_time_s"])
+                        except (TypeError, ValueError) as error:
+                            raise CvatError(f"invalid play_time_s on CVAT track {track.track_id}") from error
+                        if not math.isfinite(play_time):
+                            raise CvatError(f"invalid play_time_s on CVAT track {track.track_id}")
+                        timing_event["play_time_s"] = play_time
+                    if reviewed:
+                        timing_event.update({"reviewer": reviewer, "revision": int(revision), "reviewed_at": reviewed_at, "annotation_confidence": float(annotation_confidence)})
+                    timing_events.append(timing_event)
+                elif track.label == "ground_contact":
                     declared_tracklet_id = str(attributes.get("tracklet_id") or attributes.get("source_tracklet_id") or "").strip()
                     if not declared_tracklet_id:
                         point_proposals.append({"shot_id": shot_id, "source_frame": mapped.source_frame, "pts": mapped.source_pts, "label": track.label, "image_xy_px": list(source_point), "review_status": "unreviewed", "attributes": dict(sorted(attributes.items()))})
@@ -652,7 +699,7 @@ def manifest_annotations_from_cvat(
                     contact_key = (tracklet_id, mapped.source_frame)
                     if contact_key in contact_points:
                         raise CvatError(f"duplicate ground-contact point for {tracklet_id}@{mapped.source_frame}")
-                    contact_points[contact_key] = (source_point, confidence, dict(sorted(attributes.items())))
+                    contact_points[contact_key] = (source_point, confidence, dict(sorted(attributes.items())), review_status)
                 elif track.label == "field_landmark":
                     landmark_id = str(attributes.get("landmark_id", "")).strip()
                     role = str(attributes.get("role", "")).strip()
@@ -670,7 +717,7 @@ def manifest_annotations_from_cvat(
                             raise CvatError(f"landmark field coordinate attributes are incomplete on CVAT track {track.track_id}") from error
                         if not all(math.isfinite(value) for value in declared_field) or math.dist(declared_field, field_point) > 0.01:
                             raise CvatError(f"landmark field coordinates disagree with semantic ID {landmark_id}")
-                    landmark: dict[str, Any] = {"id": f"{shot_id}:{landmark_id}:{mapped.source_frame}", "shot_id": shot_id, "source_frame": mapped.source_frame, "pts": mapped.source_pts, "image_xy_px": list(source_point), "field_xy_yards": list(field_point), "landmark_id": landmark_id, "role": role, "review_status": "reviewed" if reviewed else "unreviewed", "annotation_source": "cvat", "cvat_track_id": track.track_id, "proposal_metadata": dict(sorted(attributes.items()))}
+                    landmark: dict[str, Any] = {"id": f"{shot_id}:{landmark_id}:{mapped.source_frame}", "shot_id": shot_id, "source_frame": mapped.source_frame, "pts": mapped.source_pts, "image_xy_px": list(source_point), "field_xy_yards": list(field_point), "landmark_id": landmark_id, "role": role, "review_status": review_status, "annotation_source": "cvat", "cvat_track_id": track.track_id, "proposal_metadata": dict(sorted(attributes.items()))}
                     if reviewed:
                         landmark.update({"reviewer": reviewer, "revision": int(revision), "reviewed_at": reviewed_at, "annotation_confidence": float(annotation_confidence)})
                     landmarks.append(landmark)
@@ -683,33 +730,69 @@ def manifest_annotations_from_cvat(
             mapped = source_by_task[box.task_frame]
             if not start_frame <= mapped.source_frame < end_frame:
                 raise CvatError(f"CVAT shape frame {mapped.source_frame} lies outside declared shot {shot_id}")
+            # An outside box is a track-state marker with no visible box to
+            # score. It is not an annotation and needs no review status.
+            if box.outside:
+                continue
             attributes = {**track.attributes, **(box.attributes or {})}
             if attributes.get("source_sha256") not in (None, "", frame_map.source_sha256):
                 raise CvatError(f"CVAT track {track.track_id} source hash does not match task frame map")
             for key, expected in (("source_frame", mapped.source_frame), ("source_pts", mapped.source_pts)):
-                if attributes.get(key) not in (None, ""):
+                # The frame map is authoritative for interpolated shapes;
+                # CVAT can copy keyframe attributes forward unchanged.
+                if box.keyframe and attributes.get(key) not in (None, ""):
                     try:
                         actual = int(attributes[key])
                     except (TypeError, ValueError) as error:
                         raise CvatError(f"invalid {key} attribute on track {track.track_id}") from error
                     if actual != expected:
                         raise CvatError(f"CVAT {key} attribute disagrees with task frame map at task frame {box.task_frame}")
+            review_status = _import_review_status(attributes, reviewed=reviewed, label=track.label, frame=mapped.source_frame)
+            if review_status is None:
+                continue
             record: dict[str, Any] = {
                 "id": f"{shot_id}:{tracklet_id}:{mapped.source_frame}",
                 "shot_id": shot_id,
+                "source_shot_id": str(attributes.get("source_shot_id") or shot_id),
                 "source_frame": mapped.source_frame,
                 "pts": mapped.source_pts,
                 "track_id": tracklet_id,
                 "label": track.label,
-                "review_status": "reviewed" if reviewed else "unreviewed",
+                "review_status": review_status,
                 "coordinate_space": "source",
-                "visibility": "outside" if box.outside else "occluded" if box.occluded else "visible",
+                "visibility": "occluded" if box.occluded else "visible",
                 "annotation_source": "cvat",
                 "cvat_track_id": track.track_id,
                 "cvat_track_source": track.source,
                 "proposal_metadata": dict(sorted(attributes.items())),
             }
-            if not box.outside and box.bbox_xyxy_px is not None:
+            raw_inference_json = attributes.get("source_inference_row_json")
+            if raw_inference_json not in (None, ""):
+                try:
+                    raw_inference = json.loads(raw_inference_json)
+                except json.JSONDecodeError as error:
+                    raise CvatError(f"invalid source inference provenance on CVAT track {track.track_id}") from error
+                if not isinstance(raw_inference, dict):
+                    raise CvatError(f"source inference provenance on CVAT track {track.track_id} must be an object")
+                source_run_id = str(attributes.get("source_run_id", "")).strip()
+                source_shot_id = str(attributes.get("source_shot_id", "")).strip()
+                if not source_run_id or not source_shot_id:
+                    raise CvatError("source inference provenance requires source_run_id and source_shot_id")
+                for key, expected in (("run_id", source_run_id), ("shot_id", source_shot_id), ("tracklet_id", tracklet_id)):
+                    if str(raw_inference.get(key, "")) != expected:
+                        raise CvatError(f"source inference {key} does not match CVAT track {track.track_id}")
+                try:
+                    inference_frame = int(raw_inference["frame_index"])
+                    inference_pts = int(raw_inference["pts"])
+                except (KeyError, TypeError, ValueError) as error:
+                    if box.keyframe:
+                        raise CvatError(f"source inference row on CVAT track {track.track_id} has invalid frame_index or pts") from error
+                    inference_frame = inference_pts = None
+                if (inference_frame, inference_pts) == (mapped.source_frame, mapped.source_pts):
+                    record["inference_provenance"] = {"run_id": source_run_id, "raw_row": raw_inference}
+                elif box.keyframe:
+                    raise CvatError(f"source inference frame/PTS does not match CVAT task frame {box.task_frame}")
+            if box.bbox_xyxy_px is not None:
                 source_box = task_bbox_to_source(box.bbox_xyxy_px, mapped)
                 if source_box[0] < 0 or source_box[1] < 0 or source_box[2] > frame_map.source_width or source_box[3] > frame_map.source_height:
                     raise CvatError(f"imported box lies outside source image at frame {mapped.source_frame}")
@@ -765,13 +848,13 @@ def manifest_annotations_from_cvat(
                 record.update({"reviewer": reviewer, "revision": int(revision), "reviewed_at": reviewed_at, "annotation_confidence": float(annotation_confidence)})
             records.append(record)
     records_by_key = {(record.get("track_id"), record.get("source_frame")): record for record in records}
-    for (tracklet_id, source_frame), (point, confidence, attributes) in sorted(contact_points.items()):
+    for (tracklet_id, source_frame), (point, confidence, attributes, review_status) in sorted(contact_points.items()):
         mapped = source_by_frame.get(source_frame)
         if mapped is None:
             raise CvatError(f"ground-contact source frame {source_frame} is absent from task map")
         record = records_by_key.get((tracklet_id, source_frame))
         if record is None:
-            record = {"id": f"{shot_id}:{tracklet_id}:{source_frame}", "shot_id": shot_id, "source_frame": source_frame, "pts": mapped.source_pts, "track_id": tracklet_id, "label": "player", "review_status": "reviewed" if reviewed else "unreviewed", "coordinate_space": "source", "annotation_source": "cvat_ground_contact", "cvat_point_attributes": attributes}
+            record = {"id": f"{shot_id}:{tracklet_id}:{source_frame}", "shot_id": shot_id, "source_frame": source_frame, "pts": mapped.source_pts, "track_id": tracklet_id, "label": "player", "review_status": review_status, "coordinate_space": "source", "annotation_source": "cvat_ground_contact", "cvat_point_attributes": attributes}
             records.append(record)
             records_by_key[(tracklet_id, source_frame)] = record
         record["ground_contact_xy_px"] = list(point)
@@ -787,6 +870,9 @@ def manifest_annotations_from_cvat(
         if not start_frame <= mapped.source_frame < end_frame:
             raise CvatError(f"CVAT tag frame {mapped.source_frame} lies outside declared shot {shot_id}")
         attributes = tag.attributes
+        review_status = _import_review_status(attributes, reviewed=reviewed, label=tag.label, frame=mapped.source_frame)
+        if review_status is None:
+            continue
         if tag.label not in {"reviewed_frame", "empty_frame", "ignored_frame"} and attributes.get("labeled") not in {"true", "1"}:
             continue
         frame_key = (shot_id, mapped.source_frame)
@@ -796,7 +882,7 @@ def manifest_annotations_from_cvat(
             "pts": mapped.source_pts,
             "labeled": False,
             "ignore": False,
-            "review_status": "reviewed" if reviewed else "unreviewed",
+            "review_status": review_status,
         })
         frame_label["labeled"] = bool(frame_label["labeled"] or attributes.get("labeled", "true") in {"true", "1"} or tag.label in {"reviewed_frame", "empty_frame", "ignored_frame"})
         frame_label["ignore"] = bool(frame_label["ignore"] or tag.label == "ignored_frame" or attributes.get("ignore", "false") in {"true", "1"})
@@ -804,4 +890,4 @@ def manifest_annotations_from_cvat(
         if reviewed:
             frame_label.update({"reviewer": reviewer, "revision": int(revision), "reviewed_at": reviewed_at, "annotation_confidence": float(annotation_confidence)})
         frame_labels.append(frame_label)
-    return records, landmarks, frame_labels, point_proposals
+    return records, landmarks, frame_labels, point_proposals, timing_events

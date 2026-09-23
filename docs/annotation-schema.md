@@ -1,7 +1,9 @@
-# Reviewed calibration and identity annotation schema
+# Reviewed football annotation schema
 
-The repository accepts version 1 JSON manifests only when the source hash and source
-coordinates match the video being evaluated. A model proposal is never ground truth.
+The repository uses version 1 JSON manifests for reviewed labels. Coordinates, frame
+indices, and presentation timestamps stay in the original source-video coordinate
+system. Inference output is a proposal; it becomes reference data only after a reviewer
+has corrected it and explicitly marked it reviewed.
 
 ```json
 {
@@ -25,15 +27,19 @@ coordinates match the video being evaluated. A model proposal is never ground tr
   },
   "annotations": [
     {
-      "id": "shot-0-frame-1234-player-17",
+      "id": "shot-0-frame-1234-cvat-17",
       "shot_id": "shot-0",
       "source_frame": 1234,
       "pts": 123400,
       "bbox_xyxy_px": [100, 200, 130, 300],
-      "track_id": "player-17",
+      "label": "player",
+      "track_id": "cvat-17",
+      "source_shot_id": "shot-0",
+      "global_id": "anon-player-0003",
       "team": "DET",
-      "visibility": "visible",
-      "ground_contact": "evaluable",
+      "visibility": "partially_visible",
+      "occluded": false,
+      "jersey_readable": false,
       "review_status": "reviewed",
       "coordinate_space": "source",
       "reviewer": "reviewer-1",
@@ -41,30 +47,131 @@ coordinates match the video being evaluated. A model proposal is never ground tr
       "reviewed_at": "2026-09-15T00:00:00Z",
       "annotation_confidence": 1.0
     }
-  ]
+  ],
+  "timing_events": [
+    {
+      "id": "play-0042-shot-0-snap",
+      "shot_id": "shot-0",
+      "source_frame": 1234,
+      "pts": 123400,
+      "event": "snap",
+      "play_id": "game-001-play-0042",
+      "correspondence_id": "snap",
+      "play_time_s": 0.0,
+      "review_status": "reviewed",
+      "reviewer": "reviewer-1",
+      "revision": 1,
+      "reviewed_at": "2026-09-15T00:00:00Z",
+      "annotation_confidence": 1.0
+    }
+  ],
+  "landmarks": [
+    {
+      "id": "shot-0-frame-1234-yardline-20-near",
+      "shot_id": "shot-0",
+      "source_frame": 1234,
+      "pts": 123400,
+      "image_xy_px": [510, 440],
+      "field_xy_yards": [20, 0],
+      "landmark_id": "yardline:20:sideline:near",
+      "role": "fit",
+      "review_status": "reviewed",
+      "reviewer": "reviewer-1",
+      "revision": 1,
+      "reviewed_at": "2026-09-15T00:00:00Z",
+      "annotation_confidence": 1.0
+    }
+  ],
+  "frame_labels": []
 }
 ```
 
-Landmark records use the same manifest with `image_xy_px`, `field_xy_yards`, `role` (`fit`
-or `withheld`), `source_frame`, `pts`, and an optional semantic `landmark_id` such as
-`yardline:20:hash:near`. When a semantic ID is present, its canonical field coordinate is
-checked before fitting, which catches mirrored or mislabeled field orientations.
+The `shots` map uses zero-based source frames with inclusive `start_frame` and exclusive
+`end_frame`. Shot ranges cannot overlap. CVAT video XML does not carry shot boundary tags;
+the reviewed `--shot` interval supplied to `scripts/import_cvat.py` populates the manifest
+shot range. CVAT task frames are task-local; the task frame map translates them to original
+source frames and exact source PTS. Source PTS values remain separate from frame numbers
+and play time.
 
-The source image is 1920×1080 in the supplied All-22 file. `source_frame` and `pts` are
-kept in the original media coordinate system. Crop or resized review images must be
-converted with `source_bbox_from_crop` before a record is marked reviewed.
+## Object labels and identity
+
+Object `label` values are `player`, `official`, and `football`. Older version 1 manifests
+that omit `label` are read as `player`. The MOT/reference exporter scores player boxes
+only; officials and football remain available in the annotation manifest without being
+treated as player tracks.
+
+`track_id` is a sequence-local track ID and must be stable across frames of one shot.
+`global_id` is an optional persistent anonymous ID linking a reviewed player across shots
+of the same play. Keep these IDs anonymous (`anon-player-0003`), never a roster identity
+or jersey number. Use `unknown` or `ambiguous` when a cross-shot identity is unresolved;
+those values do not create a global identity link. Model-proposed `player_id` values are
+stored separately as `proposal_player_id` and do not become reviewed `global_id` values.
+
+The `team` attribute uses the teams configured for the dataset (the sample uses `DET`
+and `LAR`) plus `unknown`. `visibility` is one of `visible`, `partially_visible`,
+`occluded`, `out_of_frame`, or `unknown`; `occluded` is also carried as a boolean for
+CVAT/MOT consumers that need the distinction. `jersey_readable` is a boolean. CVAT uses
+`review_status` values `unreviewed`, `reviewed`, `accepted`, and `rejected`. Imported
+records receive reviewed metadata only when the importer is explicitly invoked with
+`--mark-reviewed`, `--reviewer`, `--revision`, `--reviewed-at`, and
+`--annotation-confidence`. Each visible CVAT shape must be marked
+`reviewed`, `accepted`, or `rejected`; an `unreviewed` or missing status stops import, and
+rejected shapes are omitted from the manifest and MOT reference. CVAT `outside` shapes
+are omitted because they have no visible box to score.
+
+## Timing anchors and calibration landmarks
+
+`timing_events` record snap and corresponding action events with the original
+`source_frame` and `pts`, a `play_id`, and optionally a `correspondence_id` shared across
+replay views. `play_time_s` is a reviewed play-relative time; it never replaces or
+rewrites the media PTS. In CVAT video XML, timing events are `timing_event` point tracks
+with `event`, `play_id`, `correspondence_id`, `play_time_s`, and `source_pts` attributes.
+Only explicit point keyframes (`keyframe="1"`) become timing events; interpolated
+non-keyframes are not independent anchors.
+
+Landmarks use `image_xy_px`, `field_xy_yards`, `source_frame`, and `pts`; `role` is `fit`
+or `withheld`. Each keyframe needs at least four fit landmarks and one independent
+withheld landmark to form a schema-v2 calibration timeline. A semantic `landmark_id`,
+such as `yardline:20:hash:near`, is checked against its canonical field coordinate.
+CVAT represents these as `field_landmark` point tracks with the field coordinates,
+semantic ID, and fit/withheld role as attributes. Only explicit landmark keyframes are
+imported.
 
 Field landmarks use a fixed orientation: x=0 is the west end line, x=120 is the east end
 line, and y=0 is the near sideline. The field is 120 by 53 1/3 yards, with goal lines at
-x=10 and x=110 and hash rows at y=70.75/3 and y=53 1/3−70.75/3. Use semantic IDs such as
-`yardline:20:hash:near` and `goal_line:west:sideline:near`; repeated markings require
+x=10 and x=110 and hash rows at y=70.75/3 and y=53 1/3−70.75/3. Repeated markings need
 the side and field orientation so a mirrored fit cannot pass by appearance alone.
 
-Calibration exports retain the RANSAC fit inlier/outlier indices. A caller can also ask for
-local projection sensitivity in yards per declared pixel uncertainty; this is diagnostic
-until the contact-quality policy is frozen and reviewed on player labels.
+Calibration exports retain the RANSAC fit inlier/outlier indices. Local projection
+sensitivity in yards per declared pixel uncertainty is diagnostic until the
+contact-quality policy is frozen and reviewed on player labels.
 
-Keep these labels separate:
+## CVAT bridge and provenance
+
+CVAT proposals use a source-hashed `task-frame-map.json`: task-local frames map to original
+source frames and exact PTS values, with crop and resize transforms recorded. The XML
+keeps original observation rows in per-box `source_inference_row_json` attributes, along
+with the run, shot, and tracklet IDs. The exporter declares `player`, `official`, `football`,
+`timing_event`, `field_landmark`, and `ground_contact` labels. Human-added shapes have no fabricated inference
+provenance. The map and XML are stored together in the CVAT bundle; preserve the map when
+exporting corrected annotations. See the [CVAT video XML format](https://docs.cvat.ai/docs/manual/advanced/formats/format-cvat/).
+
+[`scripts/import_cvat.py`](../scripts/import_cvat.py) verifies the source and frame map,
+then writes an annotation manifest. It can also write `mot-reference.json` with
+`--mot-reference-output`, but only when `--mark-reviewed` and reviewer metadata are
+provided. Per-shape `review_status` is checked; rejected shapes are omitted, and
+unreviewed shapes prevent promotion. The `--mot-reference-output` option writes a
+player-only reference from a fully reviewed import. The MOT converter includes only `player` boxes;
+officials, football, timing events, and landmarks remain in the annotation manifest.
+
+The example above illustrates the reviewed form. A generated preannotation is always
+`reviewed: false`; do not use it as ground truth. Reviewers must confirm source frames,
+shot intervals, play grouping, split, landmark semantics, visibility, and identity
+ambiguity before importing it as reviewed data.
+
+## Evaluation and calibration notes
+
+Keep these separate:
 
 - fitting landmarks and withheld landmarks for calibration;
 - visible-player boxes and contact-point confidence for position evaluation;
@@ -120,8 +227,9 @@ frame mapping is an import error.
 
 `scripts/import_cvat.py` writes imported fields in the existing manifest contract:
 `shot_id`, `source_frame`, `pts`, `bbox_xyxy_px`, `track_id`, `label`, `visibility`, and
-`coordinate_space: "source"`. Each shape keeps the CVAT track id/source and its review
-state. `ground_contact` point tracks attach `ground_contact_xy_px` and confidence to the
+`coordinate_space: "source"`. Each shape keeps the CVAT track id/source, its original
+`source_shot_id`, complete inference row when available, and review state. `ground_contact`
+point tracks attach `ground_contact_xy_px` and confidence to the
 matching player annotation. A `field_landmark` point enters `landmarks` only when it has a
 canonical semantic landmark ID and `fit` or `withheld` role; incomplete point records stay
 under `point_proposals`. Imports default to `reviewed: false`; explicit reviewer metadata

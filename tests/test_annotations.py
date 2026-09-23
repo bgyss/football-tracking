@@ -111,3 +111,23 @@ def test_unreviewed_manifest_cannot_become_evaluator_reference(tmp_path) -> None
     parsed = load_annotation_manifest(write(tmp_path, value), "abc", require_reviewed=False)
     with pytest.raises(AnnotationError, match="unreviewed"):
         mot_reference_from_manifest(parsed)
+
+
+def test_mot_reference_includes_player_tracks_and_keeps_other_labels_in_manifest(tmp_path) -> None:
+    base = manifest()["annotations"][0]
+    value = manifest(annotations=[
+        {**base, "id": "player", "track_id": "p1", "label": "player"},
+        {**base, "id": "official", "track_id": "o1", "label": "official", "source_frame": 3},
+        {**base, "id": "football", "track_id": "b1", "label": "football", "source_frame": 4},
+    ])
+
+    parsed = load_annotation_manifest(write(tmp_path, value), "abc")
+    reference = mot_reference_from_manifest(parsed)
+
+    reference_ids = [
+        item["id"]
+        for frame in reference["sequences"]["shot-0"]["frames"].values()
+        for item in frame["objects"]
+    ]
+    assert reference_ids == ["p1"]
+    assert len(parsed.annotations) == 3
