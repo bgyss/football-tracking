@@ -30,6 +30,27 @@ or track purity. The second view replays the first play from the end zone; its
 tracklets cannot be joined by continuing image-space trajectories across frame
 712. The [cross-shot evaluation contract](../evaluation-plan.md) still applies.
 
+### Same-detection tracker comparison
+
+An explicit ByteTrack run reused the full source-hashed detection cache with
+the same checkpoint and class mapping. It made no second model pass and wrote
+`artifacts/all22-bytetrack-cache-2026-09-23/`. This isolates the tracker choice,
+but no reviewed boxes or IDs exist to score either backend.
+
+| Tracker | Observations | Tracklets, shot 0 / shot 1 | Median emitted boxes per frame, shot 0 / shot 1 | Empty frames |
+| --- | ---: | ---: | ---: | ---: |
+| BoT-SORT | 18,023 | 27 / 30 | 9 / 16 | 0 |
+| ByteTrack, cache hit | 19,495 | 21 / 26 | 10 / 16 | 2, one at each shot start |
+
+Both artifact sets validate structurally and have zero duplicate track IDs
+within a frame. More emitted boxes and fewer tracklets do not prove fewer ID
+switches, fewer false positives, or better player coverage. The generic
+detector cache had a median of 61 `person` proposals per sideline frame and 25
+per end-zone frame, while tracking emitted only 9 and 16 median boxes. The
+sideline shortfall is a visible candidate bottleneck for play reconstruction;
+reviewed detection and track labels are needed to localize it. The default
+tracker was not changed.
+
 ## Automated local staging
 
 `scripts/stage_local_review.py` reused the validated run and produced:
