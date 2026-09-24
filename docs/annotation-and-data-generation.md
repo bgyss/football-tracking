@@ -43,6 +43,30 @@ CVAT Community is MIT-licensed, self-hostable, and keeps the video in the local 
 
 ## End-to-end local workflow
 
+For a single local command that runs inference when needed and stages review inputs,
+use `scripts/stage_local_review.py`. Supply an existing local checkpoint so RF-DETR
+does not download weights implicitly. An existing `--run-dir` with a matching source
+hash and shot boundaries is reused.
+
+```bash
+UV_CACHE_DIR=.uv-cache uv run python scripts/stage_local_review.py \
+  --source data/all-22-lions-rams-sample.mp4 \
+  --run-dir artifacts/all22-run \
+  --output artifacts/all22-review-stage \
+  --manual-cut 712 \
+  --detector-checkpoint /path/to/local-rf-detr-small.pth
+```
+
+The command writes a shot/play inventory, exact source-frame review images with
+unreviewed field-line intersections, motion-burst timing candidates, bounded
+Tesseract jersey reads, source-addressed CVAT bundles and frame maps for each shot,
+an identity review queue, and `readiness.json`. Set `--skip-ocr` when Tesseract is
+unavailable. `stage-summary.json` records the run, shot ranges, and gate statuses.
+The source video, model weights, and generated artifacts remain local. This command
+does not assign field coordinates to line intersections, infer reviewed snap anchors,
+or promote cross-shot identities. Those decisions still require source-specific
+evidence and the review gates below.
+
 ### 1. Acquire and register footage
 
 Use `yt-dlp` only for videos you are authorized to download and use. Store a manifest containing the source URL, uploader, date, game or practice context, original resolution, downloaded hash, and permission or license notes. YouTube's Terms restrict downloading or using content unless authorized by the service, the rights holder, or applicable law; the downloader's software license does not change those rights. [yt-dlp](https://github.com/yt-dlp/yt-dlp), [YouTube Terms](https://au.youtube.com/t/terms)
