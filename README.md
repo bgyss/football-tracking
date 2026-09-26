@@ -7,6 +7,7 @@ The first version prioritizes **stable anonymous player IDs, teams, and trajecto
 - [System design](docs/system-design.md): architecture, component choices, data contracts, runtime strategy, and milestones.
 - [Evaluation plan](docs/evaluation-plan.md): measurable acceptance criteria and fair comparisons.
 - [Tool research](docs/research/tracking-tools.md): primary sources, current APIs, alternatives, and licenses.
+- [All-22 identity automation research](docs/research/all22-cross-shot-identity-2026-09-24.md): local, GPU-server, Astra and commercial options, with a [copy-ready implementation handoff](docs/goals/all22-identity-automation.md).
 - [McByte evaluation plan](docs/mcbyte-evaluation-plan.md): controlled identity-switch experiment and [integration goal prompt](docs/goals/mcbyte-integration.md) for a new task.
 - [Sample footage assessment](docs/evidence/footage-assessment.md): verified metadata and inspected frames.
 - [Accuracy, calibration, and replay guide](docs/accuracy-calibration-replay.md): how to move from the baseline to football accuracy, yard-space calibration, and cross-view identity.
